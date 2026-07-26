@@ -397,7 +397,7 @@ document.addEventListener('DOMContentLoaded', async () => {
               <div class="reward-name" style="color:${brightColor}; text-shadow: 0 1px 3px rgba(0,0,0,0.8);">${title}</div>
               ${desc ? `<div style="font-size:10px;color:#999;margin-top:1px;">${desc}</div>` : ''}
               ${det?.dropsetTitle ? `<div style="font-size:11px;color:#aaa;margin-top:2px;">${det.dropsetTitle}</div>` : ''}
-              <div class="reward-path">${drop.url || 'Unknown Path'}</div>
+              <div class="reward-tags">${(() => { const tags = []; if (det) tags.push(`<span class="tag ${det.cappedDrop ? 'tag-capped' : 'tag-uncapped'}">${det.cappedDrop ? 'Capped' : 'Uncapped'}</span>`); if (det?.rarity?.type) tags.push(`<span class="tag tag-rarity" style="color:${det.rarity.badgeBackgroundColor || '#888'}">${det.rarity.type}</span>`); return tags.join(''); })()}</div>
             </div>
           </div>
           <div class="raw-toggle"><span>View Technical Data</span> <span>▼</span></div>

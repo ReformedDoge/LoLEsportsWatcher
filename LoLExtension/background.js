@@ -9,9 +9,11 @@ const PROVIDER_YOUTUBE = 'youtube';
 
 let leagueList = null;
 let lastScheduleData = null;
+let leagueIdNameMap = {};
 
 initStats();
 initDebugMode();
+initLeagueIdNameMap();
 
 async function getLeagueWindowMap() {
     return await getFromLocalStorage('leagueWindowMap', {});
@@ -96,6 +98,22 @@ async function reopenLeagueWindow(leagueName, matchIDs) {
     }
 }
 
+async function initLeagueIdNameMap() {
+    try {
+        const s = await chrome.storage.session.get('leagueIdNameMap');
+        leagueIdNameMap = s.leagueIdNameMap || {};
+        debugLog(`initLeagueIdNameMap: ${Object.keys(leagueIdNameMap).length} league IDs loaded`);
+    } catch(e) {
+        leagueIdNameMap = {};
+    }
+}
+
+async function persistLeagueIdNameMap() {
+    try {
+        await chrome.storage.session.set({ leagueIdNameMap });
+    } catch(e) {}
+}
+
 const fetchSchedule = async () => {
     const provider = await getCurrentProvider();
     debugLog(`fetchSchedule: provider=${provider.id}`);
@@ -106,6 +124,16 @@ const fetchSchedule = async () => {
 
     if (data?.data?.schedule?.events) {
         debugLog(`fetchSchedule: ${data.data.schedule.events.length} events received`);
+        for (const event of data.data.schedule.events) {
+            if (event.league?.id && event.league?.name) {
+                const id = String(event.league.id);
+                if (!leagueIdNameMap[id]) {
+                    leagueIdNameMap[id] = event.league.name.trim();
+                }
+            }
+        }
+        persistLeagueIdNameMap();
+        debugLog(`leagueIdNameMap: ${Object.keys(leagueIdNameMap).length} IDs`);
     } else {
         debugLog('fetchSchedule: no events in response');
     }
@@ -372,6 +400,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return true;
     }
+
+    if (message.action === "resolveLeagueName" && message.leagueID) {
+        let leagueName = leagueIdNameMap[String(message.leagueID)] || null;
+        if (!leagueName && lastScheduleData?.data?.schedule?.events) {
+            for (const event of lastScheduleData.data.schedule.events) {
+                if (String(event.league?.id) === String(message.leagueID)) {
+                    leagueName = event.league.name?.trim();
+                    if (leagueName) {
+                        leagueIdNameMap[String(message.leagueID)] = leagueName;
+                        persistLeagueIdNameMap();
+                    }
+                    break;
+                }
+            }
+        }
+        debugLog(`resolveLeagueName: ${message.leagueID} -> ${leagueName || '(not found)'}`);
+        sendResponse({ leagueName });
+        return true;
+    }
+
+    if (message.action === "log") {
+        debugLog(`[Content] ${message.message}`);
+    }
 });
 
 chrome.windows.onRemoved.addListener(async (windowId) => {
@@ -424,8 +475,13 @@ function replaceURL(url, parameter) {
 
 const streamURL = async (matchURL, leagueName) => {
     const provider = await getFromLocalStorage('provider', PROVIDER_TWITCH);
-    const { streams } = await fetchStreams(leagueName);
 
+    if (provider) {
+        debugLog(`streamURL(${leagueName}): using base URL, inject.js handles ${provider}`);
+        return matchURL;
+    }
+
+    const { streams } = await fetchStreams(leagueName);
     const youtubeStream = streams.find((stream) => stream.provider === PROVIDER_YOUTUBE);
     const twitchStream = streams.find((stream) => stream.provider === PROVIDER_TWITCH);
 
@@ -456,6 +512,12 @@ async function openWindowForLeague(matchURL, leagueName, matchID, timeNow) {
 }
 
 async function checkURL() {
+    const preferred = await getFromLocalStorage('provider', PROVIDER_TWITCH);
+    if (preferred) {
+        debugLog(`checkURL: preferred provider set (${preferred}), inject.js handles stream selection`);
+        return;
+    }
+
     let leagueWindowMap = await getLeagueWindowMap();
     debugLog(`checkURL: ${Object.keys(leagueWindowMap).length} windows to check`);
 
@@ -465,6 +527,12 @@ async function checkURL() {
 
         if (!matchLeagueURL) {
             console.warn(`No valid URL found for league: ${leagueName}`);
+            continue;
+        }
+
+        const { hasStreams } = await fetchStreams(leagueName);
+        if (!hasStreams) {
+            debugLog(`checkURL: no streams for ${leagueName}, keeping current URL`);
             continue;
         }
 
@@ -481,13 +549,27 @@ async function getTab(windowId) {
     });
 }
 
+function normalizeURL(url) {
+    try {
+        let u = new URL(url);
+        u.pathname = u.pathname.replace(/\/+$/, '');
+        return u.toString();
+    } catch {
+        return url;
+    }
+}
+
 async function updateTabURL(windowId, matchURL) {
     const tab = await getTab(windowId);
-    if (tab && tab.status === 'complete' && tab.url !== matchURL) {
-        return new Promise((resolve) => {
-            chrome.tabs.update(tab.id, { url: matchURL }, resolve);
-            debugLog(`Updated tab ${tab.id} to ${matchURL}`);
-        });
+    if (tab && tab.status === 'complete') {
+        const normalizedCurrent = normalizeURL(tab.url);
+        const normalizedTarget = normalizeURL(matchURL);
+        if (normalizedCurrent !== normalizedTarget) {
+            return new Promise((resolve) => {
+                chrome.tabs.update(tab.id, { url: matchURL }, resolve);
+                debugLog(`Updated tab ${tab.id} from ${tab.url} to ${matchURL}`);
+            });
+        }
     }
     return tab;
 }

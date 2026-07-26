@@ -1,11 +1,14 @@
 (function() {
     window._lolWatcher = { forceFixEnabled: true, debugMode: false };
-    const debug = (...args) => window._lolWatcher.debugMode && console.log(...args);
+    const pageLog = (msg) => window.postMessage({ type: 'LOL_WATCHER_PAGE_LOG', message: msg }, '*');
+    const debug = (...args) => window._lolWatcher.debugMode && pageLog(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
 
     window.addEventListener('message', (e) => {
         if (e.data?.type === 'LOL_WATCHER_CONFIG') {
             window._lolWatcher.forceFixEnabled = e.data.config.forceFixEnabled;
             window._lolWatcher.debugMode = !!e.data.config.debugMode;
+            window._lolWatcher.preferredProvider = e.data.config.preferredProvider;
+            debug('[LoL Watcher] Config updated via message:', e.data.config);
         }
         if (e.data?.type === 'LOL_WATCHER_FETCH_DETAILS' && e.data.dropId) {
             fetch("https://account.service.lolesports.com/fandom-account/v1/earnedDrops/" + e.data.dropId + "?locale=en_GB", {
@@ -20,9 +23,9 @@
     window.__LOL_WATCHER_EXTENSION_ACTIVE__ = true;
     if (typeof window.__disableUserscriptMaster === 'function') {
         window.__disableUserscriptMaster();
-        console.log("[LoL Watcher] Forced previously running userscript to yield master duties.");
+        pageLog("Forced previously running userscript to yield master duties.");
     } else {
-        console.log("[LoL Watcher] Claimed master priority for RMS Fixes.");
+        pageLog("Claimed master priority for RMS Fixes.");
     }
 
     const originalWebSocket = window.WebSocket;
@@ -40,7 +43,6 @@
                     if (msg.subject === "rms:message" && msg.payload?.resource === "esports/v1/drop_fulfilled") {
                         debug("[LoL Watcher] Drop fulfilled message intercepted:", msg);
                         const dropData = {
-                            url: window.location.pathname,
                             league: window.location.pathname.split('/')[2] || 'Unknown',
                             timestamp: Date.now(),
                             ...msg
@@ -114,6 +116,92 @@
         return originalFetch.apply(this, arguments);
     };
 
+    const filterStreamsToPreferred = (data) => {
+        const pref = window._lolWatcher?.preferredProvider;
+        if (!pref) return null;
+        const fallbacks = { twitch: 'youtube', youtube: 'twitch' };
+        let modified = false;
+
+        const applyFilter = (streams) => {
+            for (const p of [pref, fallbacks[pref], null]) {
+                if (!p) return null;
+                const filtered = streams.filter(s => s.provider === p);
+                if (filtered.length) return { filtered, provider: p };
+            }
+            return null;
+        };
+
+        if (data?.data?.event?.streams?.length) {
+            const result = applyFilter(data.data.event.streams);
+            if (result) {
+                debug(`[LoL Watcher] filterStreams: event streams: ${data.data.event.streams.length} -> ${result.filtered.length} (keeping ${result.provider})`);
+                data.data.event.streams = result.filtered; modified = true;
+            }
+        }
+
+        if (data?.data?.schedule?.events) {
+            for (const event of data.data.schedule.events) {
+                if (event.streams?.length) {
+                    const result = applyFilter(event.streams);
+                    if (result) {
+                        debug(`[LoL Watcher] filterStreams: schedule event ${event.league?.name || '?'}: ${event.streams.length} -> ${result.filtered.length} (keeping ${result.provider})`);
+                        event.streams = result.filtered; modified = true;
+                    }
+                }
+            }
+        }
+
+        return modified ? data : null;
+    };
+
+    const patchedFetch = window.fetch;
+    window.fetch = function(url, options) {
+        if (window._lolWatcher.preferredProvider && typeof url === 'string' && (
+            url.includes('/getEventDetails') || url.includes('/getSchedule')
+        )) {
+            debug(`[LoL Watcher] Intercepting ${url.includes('/getEventDetails') ? 'getEventDetails' : 'getSchedule'} fetch to filter streams for "${window._lolWatcher.preferredProvider}"`);
+            const req = patchedFetch.apply(this, arguments);
+            return req.then(response => {
+                if (!response.ok) return response;
+                const ct = response.headers.get('content-type') || '';
+                if (!ct.includes('json')) return response;
+                return response.clone().json().then(data => {
+                    const filtered = filterStreamsToPreferred(data);
+                    return filtered
+                        ? new Response(JSON.stringify(filtered), { status: response.status, statusText: response.statusText, headers: response.headers })
+                        : response;
+                }).catch(() => response);
+            });
+        }
+        if (window._lolWatcher.forceFixEnabled && typeof url === 'string' && url.includes('/v1/session/clientconfig/rms')) {
+            return patchedFetch.apply(this, arguments).then(response => {
+                if (!response.ok) throw new Error("RMS Config failed with status: " + response.status);
+                return response;
+            }).catch(error => {
+                debug("[LoL Watcher] Original RMS config fetch failed! Injecting fallback config.", error.message);
+                const fallbackConfig = {
+                    "client_config_value": {
+                        "rms.allow_bad_cert.enabled": false,
+                        "rms.handshake_timeout_ms": 5000,
+                        "rms.heartbeat_interval_seconds": 55,
+                        "rms.host": "wss://eu.edge.rms.si.lolesports.com",
+                        "rms.max_reconnect_delay_ms": 300000,
+                        "rms.min_reconnect_delay_ms": 100,
+                        "rms.port": 443,
+                        "rms.protocol_preference": "ipv4",
+                        "rms.socket_timeout_ms": 30000,
+                        "rms.use_direct_connection": true
+                    }
+                };
+                return new Response(JSON.stringify(fallbackConfig), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' }
+                });
+            });
+        }
+        return patchedFetch.apply(this, arguments);
+    };
+
     const patchAllModules = (modules) => {
         for (const moduleId in modules) {
             if (Object.prototype.hasOwnProperty.call(modules, moduleId)) {
@@ -161,4 +249,7 @@
             userscriptKilled: typeof window.__disableUserscriptMaster === 'function'
         }
     }, '*');
+
+    // Request config from content script (handles race condition with postMessage)
+    window.postMessage({ type: 'LOL_WATCHER_REQUEST_CONFIG' }, '*');
 })();

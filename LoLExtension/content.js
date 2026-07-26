@@ -1,12 +1,16 @@
-console.log("League Watcher Content Script Loaded!");
+const _tag = window.location.pathname.split('/')[2] || 'home';
+const log = (msg) => chrome.runtime.sendMessage({ action: 'log', message: `[${_tag}] ${msg}` });
+let dropsQueue = Promise.resolve();
+
+log('Content script loaded.');
 
 chrome.runtime.onMessage.addListener((message) => {
     if (message.action === "togglePlayerRemoval") {
         if (message.enabled) {
-            console.log("Player Removal ENABLED.");
+            log('Player Removal ENABLED.');
             enablePlayerRemoval();
         } else {
-            console.log("Player Removal DISABLED.");
+            log('Player Removal DISABLED.');
             removeListeners();
         }
     }
@@ -48,18 +52,18 @@ function waitForElement(selector, callback) {
 
 function removeHomepagePlayer() {
     const section = document.querySelector(HOMEPAGE_PLAYER_SECTION);
-    if (section) { section.remove(); console.log("Removed homepage player section"); }
+    if (section) { section.remove(); log('Removed homepage player section'); }
 }
 
 function removeLivePlayer() {
     const player = document.querySelector(LIVE_PLAYER);
-    if (player) { player.remove(); console.log("Removed live video player"); }
+    if (player) { player.remove(); log('Removed live video player'); }
 }
 
 function enablePlayerRemoval() {
     disconnectObserver();
     if (location.href.startsWith("https://lolesports.com/live/")) {
-        waitForElement(REWARDS_BUTTON, removeLivePlayer);
+        watchLivePlayer();
     } else if (location.href.startsWith("https://lolesports.com")) {
         waitForElement(HOMEPAGE_PLAYER_SECTION, removeHomepagePlayer);
     }
@@ -74,17 +78,29 @@ function enablePlayerRemoval() {
     }
 }
 
+function watchLivePlayer() {
+    if (document.querySelector(REWARDS_BUTTON)) {
+        removeLivePlayer();
+    }
+    const root = document.querySelector('#__next') || document.body || document.documentElement;
+    currentObserver = new MutationObserver(() => {
+        if (document.querySelector(REWARDS_BUTTON)) {
+            removeLivePlayer();
+        }
+    });
+    currentObserver.observe(root, { childList: true, subtree: true });
+}
+
 function removeListeners() {
     disconnectObserver();
     if (urlCheckInterval) { clearInterval(urlCheckInterval); urlCheckInterval = null; }
 }
 
-chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode"], (data) => {
+chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode", "provider"], (data) => {
     if (data.removePlayerEnabled) enablePlayerRemoval();
-    
-    window.postMessage({ 
-        type: 'LOL_WATCHER_CONFIG', 
-        config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode } 
+    window.postMessage({
+        type: 'LOL_WATCHER_CONFIG',
+        config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider }
     }, '*');
 });
 
@@ -110,7 +126,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                     count++;
                 } catch (e) {}
             }
-            console.log("[LoL Watcher] Requested enrichment for", count, "drops.");
+            if (count > 0) log(`Requested enrichment for ${count} drops.`);
             sendResponse({ requested: count });
         });
         return true;
@@ -122,46 +138,115 @@ window.addEventListener('message', (event) => {
 
     if (event.data?.type === 'LOL_WATCHER_STATUS') {
         chrome.storage.local.set({ injectStatus: event.data.status });
-        console.log("[LoL Watcher] Inject status:", event.data.status);
+        log(`Inject status: ${JSON.stringify(event.data.status)}`);
+        chrome.storage.local.get({ drops: [] }, (res) => {
+            const drops = res.drops || [];
+            let count = 0;
+            for (const drop of drops) {
+                if (drop.details) continue;
+                try {
+                    const inner = JSON.parse(drop.payload.payload);
+                    const dropId = inner.message?.i;
+                    if (!dropId) continue;
+                    window.postMessage({ type: 'LOL_WATCHER_FETCH_DETAILS', dropId }, '*');
+                    count++;
+                } catch (e) {}
+            }
+            if (count > 0) log(`Auto-enriched ${count} drops on page load.`);
+        });
+        return;
+    }
+
+    if (event.data?.type === 'LOL_WATCHER_PAGE_LOG') {
+        log(`[Inject] ${event.data.message}`);
+        return;
+    }
+
+    if (event.data?.type === 'LOL_WATCHER_REQUEST_CONFIG') {
+        chrome.storage.local.get(["forceFixEnabled", "debugMode", "provider"], (data) => {
+            window.postMessage({
+                type: 'LOL_WATCHER_CONFIG',
+                config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider }
+            }, '*');
+        });
         return;
     }
 
     if (event.data?.type === 'LOL_DROP_DETAILS') {
-        chrome.storage.local.get({ drops: [] }, (res) => {
-            const updated = (res.drops || []).map(d => {
-                try {
-                    const inner = JSON.parse(d.payload.payload);
-                    if (inner.message?.i === event.data.dropId) return { ...d, details: event.data.details };
-                } catch (e) {}
-                return d;
+        const details = event.data.details;
+        const dropId = event.data.dropId;
+        dropsQueue = dropsQueue.then(() => new Promise(outerResolve => {
+            chrome.storage.local.get({ drops: [] }, (res) => {
+                const existing = (res.drops || []).find(d => {
+                    try {
+                        const inner = JSON.parse(d.payload.payload);
+                        return inner.message?.i === dropId;
+                    } catch (e) { return false; }
+                });
+                if (existing?.details) {
+                    outerResolve();
+                    return;
+                }
+                const leaguePromise = details?.leagueID
+                    ? new Promise(r => chrome.runtime.sendMessage({ action: 'resolveLeagueName', leagueID: details.leagueID }, resp => r(resp?.leagueName || null)))
+                    : Promise.resolve(null);
+                leaguePromise.then(leagueName => {
+                    if (!leagueName && details?.inventory?.[0]?.localizedInventory?.inventory?.internalTitle) {
+                        const word = details.inventory[0].localizedInventory.inventory.internalTitle.split(/[\s-]+/)[0];
+                        if (word && /^[A-Z0-9]{2,8}$/i.test(word) && word.toLowerCase() !== word) {
+                            leagueName = word.toUpperCase();
+                            log(`Fallback: extracted league "${leagueName}" from internalTitle`);
+                        }
+                    }
+                    chrome.storage.local.get({ drops: [] }, (res) => {
+                        const updated = (res.drops || []).map(d => {
+                            try {
+                                const inner = JSON.parse(d.payload.payload);
+                                if (inner.message?.i === dropId) {
+                                    const update = { ...d, details };
+                                    if (leagueName && d.league !== leagueName) {
+                                        update.league = leagueName;
+                                        log(`Fixed league for drop from "${d.league}" to "${leagueName}" via enrichment`);
+                                    }
+                                    return update;
+                                }
+                            } catch (e) {}
+                            return d;
+                        });
+                        chrome.storage.local.set({ drops: updated }, outerResolve);
+                        log('Drop enriched with details via page fetch.');
+                    });
+                });
             });
-            chrome.storage.local.set({ drops: updated });
-            console.log("[LoL Watcher] Drop enriched with details via page fetch.");
-        });
+        }));
         return;
     }
 
     if (event.data?.type === 'NEW_LOL_DROP') {
-        chrome.storage.local.get({ drops: [] }, (res) => {
-            const drops = res.drops || [];
-            try {
-                const innerPayload = JSON.parse(event.data.drop.payload.payload);
-                const isDuplicate = drops.some(d => {
-                    try {
-                        const existingInner = JSON.parse(d.payload.payload);
-                        return existingInner.id === innerPayload.id;
-                    } catch (e) { return false; }
-                });
-                
-                if (!isDuplicate) {
-                    drops.unshift({ ...event.data.drop, seen: false });
-                    chrome.storage.local.set({ drops });
-                    console.log("[LoL Watcher] Saved new unique drop to storage.");
+        dropsQueue = dropsQueue.then(() => new Promise(outerResolve => {
+            chrome.storage.local.get({ drops: [] }, (res) => {
+                const drops = res.drops || [];
+                try {
+                    const innerPayload = JSON.parse(event.data.drop.payload.payload);
+                    const isDuplicate = drops.some(d => {
+                        try {
+                            const existingInner = JSON.parse(d.payload.payload);
+                            return existingInner.id === innerPayload.id;
+                        } catch (e) { return false; }
+                    });
+                    
+                    if (!isDuplicate) {
+                        drops.unshift({ ...event.data.drop, seen: false });
+                        chrome.storage.local.set({ drops });
+                        log('Saved new unique drop to storage.');
+                    }
+                } catch (e) {
+                    log(`Failed to parse drop for deduplication: ${e.message}`);
                 }
-            } catch (e) {
-                console.error("[LoL Watcher] Failed to parse drop for deduplication:", e);
-            }
-        });
+                outerResolve();
+            });
+        }));
+        return;
     }
 });
 

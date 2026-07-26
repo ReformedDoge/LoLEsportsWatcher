@@ -110,7 +110,11 @@ body{
 .reward-img { width:72px; height:72px; object-fit:contain; filter:drop-shadow(0 4px 8px rgba(0,0,0,0.6)); }
 .reward-details { flex:1; display:flex; flex-direction:column; gap:4px; }
 .reward-name { font-size:16px; font-weight:700; letter-spacing:0.5px; text-transform:uppercase; }
-.reward-path { font-size:11px; color:#aaa; font-family:monospace; background:#111; padding:2px 6px; border-radius:4px; width:fit-content; }
+.reward-tags { display:flex; gap:10px; align-items:center; flex-wrap:wrap; min-height:18px; }
+.tag { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; }
+.tag-capped { color:#e8a838; }
+.tag-uncapped { color:#666; }
+.tag-rarity { line-height:14px; }
 .raw-toggle { cursor:pointer; font-size:11px; color:#888; padding:8px 16px; background:#111; border-top:1px solid #222; position:relative; z-index:1; display:flex; justify-content:space-between; align-items:center; }
 .raw-toggle:hover { color:#ccc; }
 .raw-container { display:none; position:relative; z-index:1; }
