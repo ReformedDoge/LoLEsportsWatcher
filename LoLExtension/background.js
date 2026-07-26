@@ -172,30 +172,45 @@ async function checkSchedule(data) {
     leagueList = await fetchLeagues();
     let leagueWindowMap = await getLeagueWindowMap();
     let processed = 0, opened = 0, completed = 0;
+    const openDuringBroadcast = await getFromLocalStorage('openDuringBroadcast', false);
+
+    const hasActiveEvent = (leagueName) => events.some(e =>
+        e.league.name.trim() === leagueName &&
+        e.state !== 'completed' &&
+        (e.state === 'inProgress' ||
+         (e.state === 'unstarted' && new Date(e.startTime) - date <= MATCH_WINDOW))
+    );
 
     for (const event of events) {
         const leagueName = event.league.name.trim();
         const matchID = event?.match?.id;
         const timeUntilMatch = new Date(event.startTime) - date;
 
-        debugLog(`  Event: ${leagueName} match=${matchID} state=${event.state} starts=${event.startTime} timeUntil=${Math.round(timeUntilMatch/1000)}s`);
+        debugLog(`  ${event.type}: ${leagueName} ${matchID ? `match=${matchID}` : ''}state=${event.state} starts=${event.startTime} timeUntil=${Math.round(timeUntilMatch/1000)}s`);
 
         if (await isLeagueExcluded(leagueName)) {
             debugLog(`    -> excluded, skipping`);
             continue;
         }
 
-        if (event?.state === 'unstarted' || (event?.state === 'inProgress' && (event?.type === 'match'))) {
+        if (event?.state === 'unstarted' || (event?.state === 'inProgress' && (event?.type === 'match' || (openDuringBroadcast && event.type !== 'match')))) {
             if (
                 timeUntilMatch <= MATCH_WINDOW ||
                 (event?.state === 'inProgress' && leagueWindowMap[leagueName]) ||
                 (event?.state === 'inProgress' && !leagueWindowMap[leagueName])
             ) {
-                if (leagueWindowMap[leagueName] && !leagueWindowMap[leagueName].matchIDs.includes(matchID)) {
+                if (leagueWindowMap[leagueName] && matchID && !leagueWindowMap[leagueName].matchIDs.includes(matchID)) {
+                    const wasEmpty = leagueWindowMap[leagueName].matchIDs.length === 0;
                     leagueWindowMap[leagueName].matchIDs.push(matchID);
-                    debugLog(`    -> added match to existing window for ${leagueName}`);
+                    debugLog(`    -> added match ${matchID} to existing window for ${leagueName}${wasEmpty ? ' (broadcast->match transition)' : ''}`);
                 } else if (!leagueWindowMap[leagueName]) {
-                    const { hasStreams } = await fetchStreams(leagueName);
+                    let hasStreams;
+                    if (matchID) {
+                        const result = await fetchStreams(leagueName);
+                        hasStreams = result.hasStreams;
+                    } else {
+                        hasStreams = !!leagueList?.[leagueName];
+                    }
                     if (hasStreams) {
                         const matchLeagueURL = leagueList[leagueName];
                         if (!matchLeagueURL) {
@@ -209,7 +224,7 @@ async function checkSchedule(data) {
                                 windowID: newWindow.id
                             };
                             opened++;
-                            debugLog(`    -> opened new window ${newWindow.id} for ${leagueName}`);
+                            debugLog(`    -> opened new window ${newWindow.id} for ${matchID ? 'match' : 'broadcast'} ${leagueName}${matchID ? ` (${matchID})` : ''}`);
                         }
                     } else {
                         debugLog(`    -> no streams available for ${leagueName}`);
@@ -220,20 +235,24 @@ async function checkSchedule(data) {
             }
             processed++;
         } else if (event?.state === 'completed') {
-            if (leagueWindowMap[leagueName] && leagueWindowMap[leagueName].matchIDs.includes(matchID)) {
+            if (leagueWindowMap[leagueName] && matchID && leagueWindowMap[leagueName].matchIDs.includes(matchID)) {
                 leagueWindowMap[leagueName].matchIDs = leagueWindowMap[leagueName].matchIDs.filter(id => id !== matchID);
                 debugLog(`    -> match ${matchID} completed, removed from ${leagueName}`);
             }
 
             if (leagueWindowMap[leagueName] && leagueWindowMap[leagueName].matchIDs.length === 0) {
-                debugLog(`    -> closing window for ${leagueName} (no more matches)`);
-                try {
-                    await chrome.windows.remove(leagueWindowMap[leagueName].windowID);
-                    completed++;
-                } catch (error) {
-                    console.warn(`Failed to close window ${leagueWindowMap[leagueName].windowID}, it may have been already closed.`);
+                if (hasActiveEvent(leagueName)) {
+                    debugLog(`    -> keeping window open for ${leagueName} (active event still present)`);
+                } else {
+                    debugLog(`    -> closing window for ${leagueName} (no more events)`);
+                    try {
+                        await chrome.windows.remove(leagueWindowMap[leagueName].windowID);
+                        completed++;
+                    } catch (error) {
+                        console.warn(`Failed to close window ${leagueWindowMap[leagueName].windowID}, it may have been already closed.`);
+                    }
+                    delete leagueWindowMap[leagueName];
                 }
-                delete leagueWindowMap[leagueName];
             }
         }
     }
@@ -244,7 +263,7 @@ async function checkSchedule(data) {
     await checkURL();
 }
 
-function computeLeagueStatus() {
+async function computeLeagueStatus() {
     const status = {};
     if (!lastScheduleData?.data?.schedule?.events) {
         debugLog('computeLeagueStatus: no schedule data');
@@ -255,6 +274,8 @@ function computeLeagueStatus() {
         return status;
     }
 
+    const openDuringBroadcast = await getFromLocalStorage('openDuringBroadcast', false);
+
     for (const event of lastScheduleData.data.schedule.events) {
         const rawName = event.league.name.trim();
         const leagueName = resolveLeagueName(rawName);
@@ -262,7 +283,7 @@ function computeLeagueStatus() {
             status[leagueName] = { state: null, startTime: null, url: leagueList[rawName] || leagueList[leagueName] };
         }
 
-        if (event.state === 'inProgress' && event.type === 'match') {
+        if (event.state === 'inProgress' && (event.type === 'match' || (openDuringBroadcast && event.type !== 'match'))) {
             status[leagueName].state = 'live';
             status[leagueName].startTime = event.startTime;
         } else if (event.state === 'unstarted' && !status[leagueName].state) {
@@ -321,9 +342,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.action === "getPopupData") {
+        (async () => {
         const providerId = message.providerId || 'official';
         const provider = getProvider(providerId);
-        const leagueStatus = computeLeagueStatus();
+        const leagueStatus = await computeLeagueStatus();
         sendResponse({
             providerName: provider ? provider.name : 'Unknown',
             providerId: providerId,
@@ -332,6 +354,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             pollInterval: message.pollInterval || 3,
             debugMode: _debugMode
         });
+        })();
         return true;
     }
 
@@ -354,10 +377,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const providerLeagues = leagueList ? Object.keys(leagueList) : [];
         const mergedSet = new Set([...allLeagueNames, ...providerLeagues]);
         const mergedNames = [...mergedSet];
-        chrome.storage.local.get('excludedLeagues', (res) => {
-            const rawExcluded = res.excludedLeagues || [];
-            const excluded = rawExcluded.filter(name => mergedSet.has(name));
-            const leagueStatus = computeLeagueStatus();
+        const rawExcluded = await getFromLocalStorage('excludedLeagues', []);
+        const excluded = rawExcluded.filter(name => mergedSet.has(name));
+        const leagueStatus = await computeLeagueStatus();
             const liveCount = Object.values(leagueStatus).filter(s => s.state === 'live').length;
             const upcomingCount = Object.values(leagueStatus).filter(s => s.state === 'upcoming').length;
             const scheduleEvents = lastScheduleData?.data?.schedule?.events?.length || 0;
@@ -378,7 +400,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
                 },
                 allLeagueNames: mergedNames
             });
-        });
         })();
         return true;
     }

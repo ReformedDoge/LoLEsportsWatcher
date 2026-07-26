@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   tabs.forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode']);
+  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','openDuringBroadcast']);
   const excludedLeagues = new Set(storage.excludedLeagues || []);
   let apiProviderId = storage.apiProvider || 'official';
   let leagueStatus = {};
@@ -494,6 +494,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const rpt = $('removePlayerToggle');
   const fft = $('forceFixToggle');
   const dt = $('debugToggle');
+  const bt = $('broadcastToggle');
   const pi = $('pollInterval');
   const piv = $('pollIntervalVal');
   const ss = $('settingsStatus');
@@ -559,6 +560,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
+  bt.checked = storage.openDuringBroadcast || false;
+  bt.addEventListener('change', () => {
+    const en = bt.checked;
+    chrome.storage.local.set({ openDuringBroadcast: en });
+    showStatus(en ? 'Broadcast windows on' : 'Broadcast windows off');
+  });
+
   const pollVal = storage.pollInterval || 3;
   pi.value = pollVal;
   piv.textContent = pollVal + 'm';
@@ -594,6 +602,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           b.classList.toggle('active', b.dataset.id === apiProviderId);
         });
       }
+      if (changes.openDuringBroadcast && bt) bt.checked = changes.openDuringBroadcast.newValue;
     }
   });
 
