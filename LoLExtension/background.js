@@ -139,6 +139,32 @@ const fetchSchedule = async () => {
     }
 
     await checkSchedule(data);
+    const status = await computeLeagueStatus();
+    chrome.storage.local.set({ _leagueStatus: status, _leagueStatusUpdated: Date.now() }).catch(() => {});
+
+    const allLeagueNames = getAllLeagueNames();
+    const providerLeagues = leagueList ? Object.keys(leagueList) : [];
+    const mergedSet = new Set([...allLeagueNames, ...providerLeagues]);
+    const rawExcluded = await getFromLocalStorage('excludedLeagues', []);
+    const excluded = rawExcluded.filter(name => mergedSet.has(name));
+    const liveCount = Object.values(status).filter(s => s.state === 'live').length;
+    const upcomingCount = Object.values(status).filter(s => s.state === 'upcoming').length;
+    chrome.storage.local.set({
+      _statsData: {
+        requestStats: getRequestStats(),
+        leagues: {
+          total: mergedSet.size,
+          tierCount: allLeagueNames.length,
+          excluded: excluded.length,
+          active: mergedSet.size - excluded.length,
+          live: liveCount,
+          upcoming: upcomingCount,
+          scheduleEvents: data?.data?.schedule?.events?.length || 0
+        },
+        allLeagueNames: [...mergedSet]
+      }
+    }).catch(() => {});
+
     await new Promise(resolve => setTimeout(resolve, 500));
     await restoreMissingWindows();
 };

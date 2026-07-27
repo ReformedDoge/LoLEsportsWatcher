@@ -25,9 +25,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   tabs.forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','openDuringBroadcast']);
+  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','openDuringBroadcast','_statsData']);
   const excludedLeagues = new Set(storage.excludedLeagues || []);
   let apiProviderId = storage.apiProvider || 'official';
+  let statsData = storage._statsData || null;
   let leagueStatus = {};
   let providerLeagueList = {};
 
@@ -481,8 +482,14 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   async function refreshStats() {
-    const data = await fetchStats();
-    renderStats(data);
+    const data = await chrome.storage.local.get('_statsData');
+    if (data._statsData) {
+      statsData = data._statsData;
+      if (panels.stats.classList.contains('active')) renderStats(statsData);
+    } else {
+      const res = await fetchStats();
+      if (res) { statsData = res; renderStats(res); }
+    }
   }
 
   await refreshPopup();
@@ -606,9 +613,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  setInterval(async () => {
-    if (panels.stats.classList.contains('active')) await refreshStats();
-  }, 5000);
+  // Listen for background schedule updates (written after each poll)
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local') {
+      if (changes._leagueStatus) {
+        leagueStatus = changes._leagueStatus.newValue;
+        if (panels.leagues.classList.contains('active')) renderLeagues();
+      }
+      if (changes._statsData) {
+        statsData = changes._statsData.newValue;
+        if (panels.stats.classList.contains('active')) renderStats(statsData);
+      }
+    }
+  });
 });
 
 function formatBytes(b) {
