@@ -28,6 +28,26 @@ const isLeagueExcluded = async (leagueName) => {
     return excludedLeagues.includes(leagueName) || excludedLeagues.includes(resolveLeagueName(leagueName));
 };
 
+async function verifyLeagueWindowURL(leagueName, windowID) {
+    const matchLeagueURL = leagueList?.[leagueName];
+    if (!matchLeagueURL) return;
+
+    const tab = await getTab(windowID);
+    if (!tab || !tab.url) return;
+
+    try {
+        const expectedPath = new URL(matchLeagueURL).pathname.replace(/\/+$/, '');
+        const currentPath = new URL(tab.url).pathname.replace(/\/+$/, '');
+        if (!currentPath.includes(expectedPath)) {
+            debugLog(`verifyLeagueWindowURL: ${leagueName} tab mismatch (expected ${expectedPath}, got ${currentPath}), correcting...`);
+            const url = await streamURL(matchLeagueURL, leagueName);
+            await updateTabURL(windowID, url);
+        }
+    } catch (e) {
+        console.warn(`verifyLeagueWindowURL failed for ${leagueName}:`, e);
+    }
+}
+
 async function restoreMissingWindows() {
     let leagueWindowMap = await getLeagueWindowMap();
     const updatedMap = { ...leagueWindowMap };
@@ -49,6 +69,7 @@ async function restoreMissingWindows() {
 
         try {
             await chrome.windows.get(windowID);
+            await verifyLeagueWindowURL(leagueName, windowID);
         } catch (error) {
             console.warn(`Window for ${leagueName} is missing. Reopening...`);
             const newWindow = await reopenLeagueWindow(leagueName, matchIDs);
@@ -229,6 +250,9 @@ async function checkSchedule(data) {
                     const wasEmpty = leagueWindowMap[leagueName].matchIDs.length === 0;
                     leagueWindowMap[leagueName].matchIDs.push(matchID);
                     debugLog(`    -> added match ${matchID} to existing window for ${leagueName}${wasEmpty ? ' (broadcast->match transition)' : ''}`);
+                    await verifyLeagueWindowURL(leagueName, leagueWindowMap[leagueName].windowID);
+                } else if (leagueWindowMap[leagueName]) {
+                    await verifyLeagueWindowURL(leagueName, leagueWindowMap[leagueName].windowID);
                 } else if (!leagueWindowMap[leagueName]) {
                     let hasStreams;
                     if (matchID) {
