@@ -42,12 +42,17 @@ const officialProvider = {
     async getLeagues() {
         const data = await this._api('/getLeagues');
         const leagueMap = {};
+        const idNameMap = {};
         if (data?.data?.leagues) {
             for (const league of data.data.leagues) {
                 const slug = league.slug;
                 leagueMap[league.name] = `https://lolesports.com/live/${slug}`;
+                if (league.id && league.name) {
+                    idNameMap[String(league.id)] = league.name.trim();
+                }
             }
         }
+        this._leagueIdNameMap = idNameMap;
         return { ...FALLBACK_LEAGUE_URL, ...leagueMap };
     },
 

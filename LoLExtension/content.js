@@ -110,6 +110,47 @@ script.src = chrome.runtime.getURL('inject.js');
 document.documentElement.appendChild(script);
 script.remove();
 
+async function resolveDropLeagueName(details) {
+    let leagueName = null;
+    if (details?.leagueID) {
+        leagueName = await new Promise(r => chrome.runtime.sendMessage({ action: 'resolveLeagueName', leagueID: details.leagueID }, resp => r(resp?.leagueName || null)));
+    }
+    if (!leagueName && details?.inventory?.[0]?.localizedInventory?.inventory?.internalTitle) {
+        const word = details.inventory[0].localizedInventory.inventory.internalTitle.split(/[\s-]+/)[0];
+        if (word && /^[A-Z0-9]{2,8}$/i.test(word) && word.toLowerCase() !== word) {
+            leagueName = word.toUpperCase();
+            log(`Fallback: extracted league "${leagueName}" from internalTitle`);
+        }
+    }
+    return leagueName;
+}
+
+async function reconcileDropLeagues() {
+    const res = await chrome.storage.local.get({ drops: [] });
+    const drops = res.drops || [];
+    let changed = 0;
+    let needsWrite = false;
+    const updated = [];
+    for (const d of drops) {
+        if (d.leagueResolved || !d.details?.leagueID) { updated.push(d); continue; }
+        const leagueName = await resolveDropLeagueName(d.details);
+        if (leagueName) {
+            updated.push({ ...d, league: leagueName, leagueResolved: true });
+            needsWrite = true;
+            if (d.league !== leagueName) {
+                log(`Reconciled league for drop from "${d.league}" to "${leagueName}" via leagueID`);
+                changed++;
+            }
+        } else {
+            updated.push(d);
+        }
+    }
+    if (needsWrite) {
+        await chrome.storage.local.set({ drops: updated });
+        if (changed > 0) log(`Reconciled league names for ${changed} drops via leagueID.`);
+    }
+}
+
 // Retroactively enrich drops missing details (triggered via message from popup)
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.action === 'enrich-drops') {
@@ -129,6 +170,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (count > 0) log(`Requested enrichment for ${count} drops.`);
             sendResponse({ requested: count });
         });
+        dropsQueue = dropsQueue.then(() => reconcileDropLeagues());
         return true;
     }
 });
@@ -154,6 +196,7 @@ window.addEventListener('message', (event) => {
             }
             if (count > 0) log(`Auto-enriched ${count} drops on page load.`);
         });
+        dropsQueue = dropsQueue.then(() => reconcileDropLeagues());
         return;
     }
 
@@ -184,29 +227,25 @@ window.addEventListener('message', (event) => {
                     } catch (e) { return false; }
                 });
                 if (existing?.details) {
+                    if (!existing.leagueResolved && existing.details?.leagueID) {
+                        dropsQueue = dropsQueue.then(() => reconcileDropLeagues());
+                    }
                     outerResolve();
                     return;
                 }
-                const leaguePromise = details?.leagueID
-                    ? new Promise(r => chrome.runtime.sendMessage({ action: 'resolveLeagueName', leagueID: details.leagueID }, resp => r(resp?.leagueName || null)))
-                    : Promise.resolve(null);
-                leaguePromise.then(leagueName => {
-                    if (!leagueName && details?.inventory?.[0]?.localizedInventory?.inventory?.internalTitle) {
-                        const word = details.inventory[0].localizedInventory.inventory.internalTitle.split(/[\s-]+/)[0];
-                        if (word && /^[A-Z0-9]{2,8}$/i.test(word) && word.toLowerCase() !== word) {
-                            leagueName = word.toUpperCase();
-                            log(`Fallback: extracted league "${leagueName}" from internalTitle`);
-                        }
-                    }
+                resolveDropLeagueName(details).then(leagueName => {
                     chrome.storage.local.get({ drops: [] }, (res) => {
                         const updated = (res.drops || []).map(d => {
                             try {
                                 const inner = JSON.parse(d.payload.payload);
                                 if (inner.message?.i === dropId) {
                                     const update = { ...d, details };
-                                    if (leagueName && d.league !== leagueName) {
+                                    if (leagueName) {
                                         update.league = leagueName;
-                                        log(`Fixed league for drop from "${d.league}" to "${leagueName}" via enrichment`);
+                                        update.leagueResolved = true;
+                                        if (d.league !== leagueName) {
+                                            log(`Fixed league for drop from "${d.league}" to "${leagueName}" via enrichment`);
+                                        }
                                     }
                                     return update;
                                 }

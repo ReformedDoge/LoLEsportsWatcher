@@ -195,6 +195,19 @@ const fetchLeagues = async () => {
     const data = await provider.getLeagues();
     if (data) {
         debugLog(`fetchLeagues: ${Object.keys(data).length} leagues mapped`);
+        if (provider?._leagueIdNameMap) {
+            let added = 0;
+            for (const [id, name] of Object.entries(provider._leagueIdNameMap)) {
+                if (!leagueIdNameMap[id]) {
+                    leagueIdNameMap[id] = name;
+                    added++;
+                }
+            }
+            if (added > 0) {
+                persistLeagueIdNameMap();
+                debugLog(`leagueIdNameMap: added ${added} league IDs from getLeagues (total ${Object.keys(leagueIdNameMap).length})`);
+            }
+        }
     }
     return data;
 };
@@ -473,21 +486,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.action === "resolveLeagueName" && message.leagueID) {
-        let leagueName = leagueIdNameMap[String(message.leagueID)] || null;
-        if (!leagueName && lastScheduleData?.data?.schedule?.events) {
-            for (const event of lastScheduleData.data.schedule.events) {
-                if (String(event.league?.id) === String(message.leagueID)) {
-                    leagueName = event.league.name?.trim();
-                    if (leagueName) {
-                        leagueIdNameMap[String(message.leagueID)] = leagueName;
-                        persistLeagueIdNameMap();
+        (async () => {
+            let leagueName = leagueIdNameMap[String(message.leagueID)] || null;
+            if (!leagueName && lastScheduleData?.data?.schedule?.events) {
+                for (const event of lastScheduleData.data.schedule.events) {
+                    if (String(event.league?.id) === String(message.leagueID)) {
+                        leagueName = event.league.name?.trim();
+                        if (leagueName) {
+                            leagueIdNameMap[String(message.leagueID)] = leagueName;
+                            persistLeagueIdNameMap();
+                        }
+                        break;
                     }
-                    break;
                 }
             }
-        }
-        debugLog(`resolveLeagueName: ${message.leagueID} -> ${leagueName || '(not found)'}`);
-        sendResponse({ leagueName });
+            if (!leagueName) {
+                const provider = await getCurrentProvider();
+                await provider.getLeagues();
+                leagueName = provider._leagueIdNameMap?.[String(message.leagueID)] || null;
+                if (leagueName) {
+                    leagueIdNameMap[String(message.leagueID)] = leagueName;
+                    persistLeagueIdNameMap();
+                }
+            }
+            debugLog(`resolveLeagueName: ${message.leagueID} -> ${leagueName || '(not found)'}`);
+            sendResponse({ leagueName });
+        })();
         return true;
     }
 
