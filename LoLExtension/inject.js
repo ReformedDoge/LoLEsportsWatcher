@@ -71,9 +71,51 @@
     // Fake Twitch/YouTube players: no iframe, no video bandwidth. Gated by removePlayerEnabled.
     const TWITCH_STATIC_DEFAULTS = { READY: 'ready', PLAYING: 'playing', PAUSE: 'pause', ENDED: 'ended', PLAY: 'play', PLAYBACK_BLOCKED: 'playback_blocked', OFFLINE: 'offline', ONLINE: 'online' };
 
+    // Re-fire stored PLAYING listeners when auth flips false->true.
+    window._lolWatcher._authRefire = window._lolWatcher._authRefire || [];
+    let _lastAuth = null;
+    function readAuth() {
+        try {
+            const a = window.RiotBar?.account?.getAuthState();
+            if (!a) return null;
+            return !!a.isAuthenticated;
+        } catch (e) { return null; }
+    }
+    setInterval(() => {
+        if (!window._lolWatcher.fakePlayerEnabled) return;
+        const a = readAuth();
+        if (a === true && _lastAuth === false) {
+            debug('[LoL Watcher] Auth became ready, re-firing PLAYING.');
+            for (const fn of window._lolWatcher._authRefire) {
+                try { fn(); } catch (e) {}
+            }
+        }
+        if (a !== null) _lastAuth = a;
+        else if (_lastAuth === null) _lastAuth = false;
+    }, 20000);
+
+    // Re-fire PLAYING on an interval, no-op while beating.
+    function keepPlaying(listeners, Statics) {
+        if (listeners.__lolWatcherKeepAlive) return;
+        listeners.__lolWatcherKeepAlive = true;
+        setInterval(() => {
+            const s = listeners.get(Statics.PLAYING);
+            if (s) for (const cb of [...s]) {
+                try { cb(); } catch (e) {}
+            }
+        }, 5 * 60 * 1000);
+    }
+
     function makeFakeTwitchPlayer(Statics, elementId, options) {
         const listeners = new Map();
         const fireLater = (cb, ms) => setTimeout(() => { try { cb(); } catch (e) {} }, ms);
+        const firePlaying = () => {
+            const s = listeners.get(Statics.PLAYING);
+            if (s) for (const cb of [...s]) {
+                try { cb(); } catch (e) {}
+            }
+        };
+        window._lolWatcher._authRefire.push(firePlaying);
         const fake = {
             __lolWatcherFake: true,
             _elementId: elementId,
@@ -85,7 +127,7 @@
                 // Event order: READY at 30ms, PLAY at 60ms, PLAYING at 150ms. Never PAUSE/ENDED/OFFLINE/PLAYBACK_BLOCKED.
                 if (evt === Statics.READY) fireLater(cb, 30);
                 else if (evt === Statics.PLAY) fireLater(cb, 60);
-                else if (evt === Statics.PLAYING) fireLater(cb, 150);
+                else if (evt === Statics.PLAYING) { fireLater(cb, 150); keepPlaying(listeners, Statics); }
             },
             removeEventListener(evt, cb) {
                 const s = listeners.get(evt);
@@ -122,13 +164,33 @@
     }
 
     function makeFakeYTPlayer(elementId, opts) {
+        const listeners = new Map();
+        window._lolWatcher._authRefire.push(() => {
+            const s = listeners.get('onStateChange');
+            if (s) for (const cb of [...s]) {
+                try { cb({ data: 1 }); } catch (e) {}
+            }
+        });
         const fake = {
             __lolWatcherFake: true,
             _elementId: elementId,
             _options: opts,
             addEventListener(evt, cb) {
                 if (typeof cb !== 'function') return;
-                if (evt === 'onStateChange') setTimeout(() => { try { cb({ data: 1 }); } catch (e) {} }, 60);
+                if (!listeners.has(evt)) listeners.set(evt, new Set());
+                listeners.get(evt).add(cb);
+                if (evt === 'onStateChange') {
+                    setTimeout(() => { try { cb({ data: 1 }); } catch (e) {} }, 60);
+                    if (!listeners.__lolWatcherKeepAlive) {
+                        listeners.__lolWatcherKeepAlive = true;
+                        setInterval(() => {
+                            const s = listeners.get('onStateChange');
+                            if (s) for (const fn of [...s]) {
+                                try { fn({ data: 1 }); } catch (e) {}
+                            }
+                        }, 5 * 60 * 1000);
+                    }
+                }
                 else if (evt === 'onReady') setTimeout(() => { try { cb(); } catch (e) {} }, 40);
             },
             removeEventListener() {},

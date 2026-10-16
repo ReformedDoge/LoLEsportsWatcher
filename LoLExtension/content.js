@@ -191,6 +191,7 @@ function enablePlayerRemoval() {
     fakeHeartbeatOk = false;
     if (isLivePage()) {
         watchLivePlayer();
+        enableGrayWatchdog();
     } else if (location.href.startsWith("https://lolesports.com")) {
         waitForElement(HOMEPAGE_PLAYER_SECTION, removeHomepagePlayer);
     }
@@ -233,7 +234,56 @@ function watchLivePlayer() {
 function removeListeners() {
     removalEnabled = false;
     disconnectObserver();
+    if (grayWatchInterval) { clearInterval(grayWatchInterval); grayWatchInterval = null; }
     if (urlCheckInterval) { clearInterval(urlCheckInterval); urlCheckInterval = null; }
+}
+
+// Gray info state: login button means logged-out, /rewards link means opted-out.
+function rewardsGrayKind() {
+    const btn = findRewardsButton();
+    if (!btn) return null;
+    const icon = btn.querySelector('[data-type]');
+    if (!icon || icon.getAttribute('data-type') !== 'info') return icon ? 'other' : null;
+    const root = btn.closest('div[data-open]');
+    if (root?.querySelector('a[href="/rewards"]')) return 'optedout';
+    return 'loggedout';
+}
+
+// Reload on logged-out only, capped per tab. Opted-out is server-side.
+let graySince = 0;
+let grayWatchInterval = null;
+let grayOptedOutLogged = false;
+
+function enableGrayWatchdog() {
+    if (grayWatchInterval) return;
+    graySince = 0;
+    grayWatchInterval = setInterval(() => {
+        if (!removalEnabled) return;
+        let kind = null;
+        try { kind = rewardsGrayKind(); } catch (e) { return; }
+        if (kind === 'optedout') {
+            if (!grayOptedOutLogged) {
+                grayOptedOutLogged = true;
+                log('Rewards opted out (see /rewards), reload cannot fix this');
+            }
+            graySince = 0;
+            return;
+        }
+        if (kind !== 'loggedout') { graySince = 0; return; }
+        if (!graySince) { graySince = Date.now(); return; }
+        if (Date.now() - graySince < 120000) return;
+        let n = 0;
+        try { n = parseInt(sessionStorage.getItem('lolGrayReloads') || '0', 10) || 0; } catch (e) {}
+        if (n < 2) {
+            try { sessionStorage.setItem('lolGrayReloads', String(n + 1)); } catch (e) {}
+            log(`Rewards logged out for 120s, reloading (attempt ${n + 1}/2)`);
+            location.reload();
+        } else {
+            log('Rewards logged out after reloads, giving up for this tab');
+            clearInterval(grayWatchInterval);
+            grayWatchInterval = null;
+        }
+    }, 15000);
 }
 
 function postConfig(data) {
