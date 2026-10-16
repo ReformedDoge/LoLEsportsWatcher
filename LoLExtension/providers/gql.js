@@ -31,6 +31,15 @@ const gqlProvider = {
                 'content-type': 'application/json'
             }
         });
+        if (data && !data.errors) {
+            chrome.storage.local.get(['gqlTable'], (stored) => {
+                const op = stored.gqlTable?.ops?.[name];
+                if (op && !op.seen) {
+                    op.seen = true; op.seenAt = Date.now();
+                    chrome.storage.local.set({ gqlTable: stored.gqlTable }).catch(() => {});
+                }
+            });
+        }
         if (data?.errors?.length) {
             debugLog(`gqlProvider: ${name} errors: ${JSON.stringify(data.errors).slice(0, 200)}`);
             chrome.storage.local.set({ gqlDrift: { at: Date.now(), detail: `gql ${name} errors` } }).catch(() => {});

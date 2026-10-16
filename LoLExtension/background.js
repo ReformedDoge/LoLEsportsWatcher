@@ -543,6 +543,63 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return true;
     }
 
+    if (message.action === "testGqlHashes") {
+        (async () => {
+            const stored = await chrome.storage.local.get(['gqlTable']);
+            const ops = stored.gqlTable?.ops || {};
+            const table = {};
+            for (const [name, op] of Object.entries(ops)) {
+                table[name] = `${(op.hash || '?').slice(0, 12)} seen=${!!op.seen}`;
+            }
+            const probe = { chunksScanned: 0, manifestUrl: null, manifestOps: 0, found: {} };
+            try {
+                const pages = ['https://lolesports.com/en-GB/live/worlds', 'https://lolesports.com/en-GB/rewards'];
+                const urls = [];
+                for (const p of pages) {
+                    const html = await (await fetch(p)).text();
+                    for (const m of html.matchAll(/\/_next\/static\/chunks\/([a-zA-Z0-9._-]+\.js)/g)) {
+                        const u = 'https://lolesports.com/_next/static/chunks/' + m[1];
+                        if (!urls.includes(u)) urls.push(u);
+                    }
+                    if (urls.length >= 15) break;
+                }
+                for (const u of urls.slice(0, 15)) {
+                    let js = null;
+                    try {
+                        const res = await fetch(u);
+                        if (!res.ok) continue;
+                        js = await res.text();
+                        if (js.length > 1500000) continue;
+                    } catch (e) { continue; }
+                    probe.chunksScanned++;
+                    if (!js.includes('apollo-persisted-query-manifest')) continue;
+                    const pairs = extractIdsFromJs(js);
+                    if (Object.keys(pairs).length >= 10) {
+                        probe.manifestUrl = u.split('/').pop();
+                        probe.manifestOps = Object.keys(pairs).length;
+                        probe.found = pairs;
+                        break;
+                    }
+                }
+            } catch (e) {
+                probe.error = String((e && e.message) || e);
+            }
+            const compare = {};
+            for (const [name, op] of Object.entries(ops)) {
+                if (probe.found[name]) {
+                    compare[name] = probe.found[name] === op.hash ? 'match' : `MISMATCH table=${op.hash.slice(0, 12)} manifest=${probe.found[name].slice(0, 12)}`;
+                } else {
+                    compare[name] = op.seen ? 'table-only (wire-confirmed)' : 'table-only (unconfirmed)';
+                }
+            }
+            for (const name of Object.keys(probe.found)) {
+                if (!ops[name]) compare[name] = 'manifest-only (new op)';
+            }
+            sendResponse({ table, probe: { chunksScanned: probe.chunksScanned, manifestUrl: probe.manifestUrl, manifestOps: probe.manifestOps, error: probe.error || null }, compare });
+        })();
+        return true;
+    }
+
     if (message.action === "compareProviders") {
         (async () => {
             const out = {};

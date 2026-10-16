@@ -32,10 +32,11 @@
     function gqlRequestInfo(url, options) {
         try {
             let op = null, hash = null;
-            if (typeof url === 'string') {
-                const q = url.indexOf('?');
+            const urlStr = typeof url === 'string' ? url : (url && typeof url.url === 'string' ? url.url : null);
+            if (urlStr) {
+                const q = urlStr.indexOf('?');
                 if (q !== -1) {
-                    const qs = url.slice(q + 1);
+                    const qs = urlStr.slice(q + 1);
                     const mOp = /(?:^|&)operationName=([^&]+)/.exec(qs);
                     if (mOp) op = decodeURIComponent(mOp[1]);
                     const mExt = /(?:^|&)extensions=([^&]+)/.exec(qs);
@@ -414,11 +415,13 @@
             });
         }
         // Filter legacy REST and /api/gql. Known stream ops are parsed, known others pass through, unknown ones are shape-sniffed.
-        if (window._lolWatcher.preferredProvider && typeof url === 'string' && (
-            url.includes('/getEventDetails') || url.includes('/getSchedule') || url.includes('/api/gql')
+        if (window._lolWatcher.preferredProvider && (typeof url === 'string' || (url && typeof url.url === 'string')) && (
+            (typeof url === 'string' ? url : url.url).includes('/getEventDetails') || (typeof url === 'string' ? url : url.url).includes('/getSchedule') || (typeof url === 'string' ? url : url.url).includes('/api/gql')
         )) {
-            const gqlInfo = url.includes('/api/gql') ? gqlRequestInfo(url, options) : null;
+            const urlStr = typeof url === 'string' ? url : url.url;
+            const gqlInfo = urlStr.includes('/api/gql') ? gqlRequestInfo(url, options) : null;
             if (gqlInfo && gqlInfo.hash) reportGqlPair(gqlInfo.op, gqlInfo.hash);
+            else if (gqlInfo && gqlInfo.op) debug(`[LoL Watcher] gql op without hash: ${gqlInfo.op}`);
             const table = window._lolWatcher.gqlTable || {};
             const knownOp = !!(gqlInfo && gqlInfo.op && table[gqlInfo.op]);
             const streamOp = !!gqlInfo?.op && GQL_STREAM_OPS.includes(gqlInfo.op);
