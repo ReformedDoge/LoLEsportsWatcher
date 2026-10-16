@@ -773,7 +773,7 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 
 async function createWindow(url, state) {
     try {
-        return await new Promise((resolve, reject) => {
+        const window = await new Promise((resolve, reject) => {
             chrome.windows.create({ url, state }, (window) => {
                 if (chrome.runtime.lastError || !window) {
                     reject(`Failed to create window: ${chrome.runtime.lastError?.message}`);
@@ -782,6 +782,20 @@ async function createWindow(url, state) {
                 }
             });
         });
+        // Stream tabs run for hours unattended, opt out of automatic discard.
+        try {
+            const tabs = await new Promise((resolve) => {
+                chrome.tabs.query({ windowId: window.id }, resolve);
+            });
+            for (const tab of tabs || []) {
+                if (tab.url && !tab.url.startsWith('opera:') && !tab.url.startsWith('chrome:')) {
+                    chrome.tabs.update(tab.id, { autoDiscardable: false }, () => {
+                        if (!chrome.runtime.lastError) debugLog(`Tab ${tab.id} marked non-discardable`);
+                    });
+                }
+            }
+        } catch (e) {}
+        return window;
     } catch (error) {
         console.error("Error creating window:", error);
     }
@@ -806,11 +820,13 @@ function replaceURL(url, parameter) {
     return urlObj.toString();
 }
 
-const streamURL = async (matchURL, leagueName) => {
+const streamURL = async (matchURL, leagueName, matchID = null) => {
     const provider = await getFromLocalStorage('provider', PROVIDER_TWITCH);
 
     if (provider) {
-        debugLog(`streamURL(${leagueName}): using base URL, inject.js handles ${provider}`);
+        const resolved = await resolveStreamUrl(matchURL, leagueName, matchID, provider);
+        if (resolved) return resolved;
+        debugLog(`streamURL(${leagueName}): no ${provider} stream resolved, using base URL`);
         return matchURL;
     }
 
@@ -836,9 +852,54 @@ const streamURL = async (matchURL, leagueName) => {
     return replaceURL(matchURL, streamId);
 };
 
+// Resolve an explicit provider stream URL via watchLiveQuery, whose stream
+// ids are the page URL ids. Falls back to null (caller keeps base URL).
+async function resolveStreamUrl(matchURL, leagueName, matchID, provider) {
+    try {
+        const stored = await chrome.storage.local.get(['gqlTable']);
+        const table = stored.gqlTable?.ops || {};
+        const hash = table.watchLiveQuery?.hash;
+        if (!hash) return null;
+        const params = new URLSearchParams({
+            operationName: 'watchLiveQuery',
+            variables: JSON.stringify({ hl: 'en-GB', sport: ['lol'], eventState: ['inProgress'], pageSize: 50 }),
+            extensions: JSON.stringify({ persistedQuery: { version: 1, sha256Hash: hash } })
+        });
+        const res = await fetch(`${GQL_API_BASE}?${params.toString()}`, {
+            headers: {
+                'x-api-key': OFFICIAL_API_KEY,
+                'apollo-require-preflight': 'true',
+                'apollographql-client-name': 'Esports Web',
+                'apollographql-client-version': (stored.gqlTable?.client?.version || '1f05c07')
+            }
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const events = data?.data?.esports?.events || [];
+        const event = events.find(e => e.match?.id === matchID && e.league?.name?.trim() === leagueName)
+            || events.find(e => e.league?.name?.trim() === leagueName);
+        const streams = event?.streams || [];
+        if (!streams.length) return null;
+        const chain = [provider, ...['twitch', 'youtube', 'afreecatv', 'trovo'].filter(p => p !== provider)];
+        for (const p of chain) {
+            const pool = streams.filter(s => s.provider === p);
+            if (!pool.length) continue;
+            const pick = pool.find(s => (s.mediaLocale?.locale || '').toLowerCase().startsWith('en'))
+                || pool[0];
+            if (pick?.id) {
+                debugLog(`resolveStreamUrl(${leagueName}): ${p} stream ${pick.id} (${pick.mediaLocale?.locale || '?'})`);
+                return replaceURL(matchURL, String(pick.id));
+            }
+        }
+    } catch (e) {
+        debugLog(`resolveStreamUrl failed: ${(e && e.message) || e}`);
+    }
+    return null;
+}
+
 async function openWindowForLeague(matchURL, leagueName, matchID, timeNow) {
     const windowState = await getFromLocalStorage('windowState', 'normal');
-    const url = await streamURL(matchURL, leagueName);
+    const url = await streamURL(matchURL, leagueName, matchID);
     const window = await createWindow(url, windowState);
     debugLog(`Opened window ${window.id} for ${leagueName} match ${matchID}`);
     return window;
@@ -877,7 +938,8 @@ async function checkURL() {
 async function getTab(windowId) {
     return new Promise((resolve) => {
         chrome.tabs.query({ windowId }, (tabs) => {
-            resolve(tabs && tabs.length > 0 ? tabs[0] : null);
+            if (!tabs || !tabs.length) { resolve(null); return; }
+            resolve(tabs.find(t => ((t.pendingUrl || t.url) || '').includes('lolesports.com/live')) || tabs[0]);
         });
     });
 }
@@ -899,8 +961,14 @@ async function updateTabURL(windowId, matchURL) {
         const normalizedTarget = normalizeURL(matchURL);
         if (normalizedCurrent !== normalizedTarget) {
             return new Promise((resolve) => {
-                chrome.tabs.update(tab.id, { url: matchURL }, resolve);
-                debugLog(`Updated tab ${tab.id} from ${tab.url} to ${matchURL}`);
+                chrome.tabs.update(tab.id, { url: matchURL }, () => {
+                    if (chrome.runtime.lastError) {
+                        debugLog(`updateTabURL: tab ${tab.id} not updated (${chrome.runtime.lastError.message})`);
+                    } else {
+                        debugLog(`Updated tab ${tab.id} from ${tab.url} to ${matchURL}`);
+                    }
+                    resolve();
+                });
             });
         }
     }

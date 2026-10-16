@@ -4,8 +4,7 @@
     const debug = (...args) => window._lolWatcher.debugMode && pageLog(args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '));
     const notifyFake = (state, extra) => window.postMessage({ type: 'LOL_WATCHER_FAKE_HEARTBEAT', state, ...(extra || {}) }, '*');
 
-    // GQL tracker: operationName-gated filtering, passive op/hash and chunk harvesting.
-    const GQL_STREAM_OPS = ['watchLiveQuery', 'watchVodQuery', 'scheduleEvents', 'homeEvents'];
+    // GQL observer: harvest op/hash pairs, flag bad statuses. No body reads.
     const _gqlSeenHashes = {};
     try {
         const _chunksSeen = {};
@@ -71,40 +70,23 @@
     // Fake Twitch/YouTube players: no iframe, no video bandwidth. Gated by removePlayerEnabled.
     const TWITCH_STATIC_DEFAULTS = { READY: 'ready', PLAYING: 'playing', PAUSE: 'pause', ENDED: 'ended', PLAY: 'play', PLAYBACK_BLOCKED: 'playback_blocked', OFFLINE: 'offline', ONLINE: 'online' };
 
-    // Re-fire stored PLAYING listeners when auth flips false->true.
+    // Stored PLAYING refires, fired on demand by state transitions and tab return.
     window._lolWatcher._authRefire = window._lolWatcher._authRefire || [];
-    let _lastAuth = null;
-    function readAuth() {
-        try {
-            const a = window.RiotBar?.account?.getAuthState();
-            if (!a) return null;
-            return !!a.isAuthenticated;
-        } catch (e) { return null; }
-    }
-    setInterval(() => {
-        if (!window._lolWatcher.fakePlayerEnabled) return;
-        const a = readAuth();
-        if (a === true && _lastAuth === false) {
-            debug('[LoL Watcher] Auth became ready, re-firing PLAYING.');
-            for (const fn of window._lolWatcher._authRefire) {
-                try { fn(); } catch (e) {}
-            }
-        }
-        if (a !== null) _lastAuth = a;
-        else if (_lastAuth === null) _lastAuth = false;
-    }, 20000);
 
-    // Re-fire PLAYING on an interval, no-op while beating.
-    function keepPlaying(listeners, Statics) {
-        if (listeners.__lolWatcherKeepAlive) return;
-        listeners.__lolWatcherKeepAlive = true;
-        setInterval(() => {
-            const s = listeners.get(Statics.PLAYING);
-            if (s) for (const cb of [...s]) {
-                try { cb(); } catch (e) {}
-            }
-        }, 5 * 60 * 1000);
+    // Re-fire stored PLAYING listeners on demand. Repeat onPlay is a no-op
+    // while beating, and a no-op when disabled, so triggers stay cheap.
+    function fireAllPlaying() {
+        if (!window._lolWatcher.fakePlayerEnabled) return;
+        for (const fn of (window._lolWatcher._authRefire || [])) {
+            try { fn(); } catch (e) {}
+        }
     }
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) fireAllPlaying(); });
+    document.addEventListener('freeze', () => pageLog('[LoL Watcher] Document FROZEN, JS suspended.'), true);
+    document.addEventListener('resume', () => { pageLog('[LoL Watcher] Document RESUMED.'); fireAllPlaying(); }, true);
+    window.addEventListener('focus', () => fireAllPlaying());
+    window.addEventListener('online', () => fireAllPlaying());
+    window.addEventListener('pageshow', () => fireAllPlaying());
 
     function makeFakeTwitchPlayer(Statics, elementId, options) {
         const listeners = new Map();
@@ -124,10 +106,11 @@
                 if (typeof cb !== 'function') return;
                 if (!listeners.has(evt)) listeners.set(evt, new Set());
                 listeners.get(evt).add(cb);
+                debug('[LoL Watcher] fake twitch listener:', String(evt));
                 // Event order: READY at 30ms, PLAY at 60ms, PLAYING at 150ms. Never PAUSE/ENDED/OFFLINE/PLAYBACK_BLOCKED.
                 if (evt === Statics.READY) fireLater(cb, 30);
                 else if (evt === Statics.PLAY) fireLater(cb, 60);
-                else if (evt === Statics.PLAYING) { fireLater(cb, 150); keepPlaying(listeners, Statics); }
+                else if (evt === Statics.PLAYING) fireLater(cb, 150);
             },
             removeEventListener(evt, cb) {
                 const s = listeners.get(evt);
@@ -144,6 +127,7 @@
 
     function wrapTwitchPlayer() {
         try {
+            if (!window._lolWatcher.fakePlayerEnabled) return false;
             const cur = window.Twitch && window.Twitch.Player;
             if (!cur || cur.__lolWatcherFakeWrapped) return false;
             const Statics = {};
@@ -179,18 +163,8 @@
                 if (typeof cb !== 'function') return;
                 if (!listeners.has(evt)) listeners.set(evt, new Set());
                 listeners.get(evt).add(cb);
-                if (evt === 'onStateChange') {
-                    setTimeout(() => { try { cb({ data: 1 }); } catch (e) {} }, 60);
-                    if (!listeners.__lolWatcherKeepAlive) {
-                        listeners.__lolWatcherKeepAlive = true;
-                        setInterval(() => {
-                            const s = listeners.get('onStateChange');
-                            if (s) for (const fn of [...s]) {
-                                try { fn({ data: 1 }); } catch (e) {}
-                            }
-                        }, 5 * 60 * 1000);
-                    }
-                }
+                debug('[LoL Watcher] fake youtube listener:', String(evt));
+                if (evt === 'onStateChange') setTimeout(() => { try { cb({ data: 1 }); } catch (e) {} }, 60);
                 else if (evt === 'onReady') setTimeout(() => { try { cb(); } catch (e) {} }, 40);
             },
             removeEventListener() {},
@@ -210,6 +184,7 @@
 
     function wrapYTPlayer() {
         try {
+            if (!window._lolWatcher.fakePlayerEnabled) return false;
             if (!window.YT) return false;
             window.YT.PlayerState = window.YT.PlayerState || { UNSTARTED: -1, ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 };
             const cur = window.YT.Player;
@@ -242,41 +217,33 @@
         wrapYTPlayer();
     }
 
-    // Re-wrap embed scripts that load late.
+    // Re-wrap on embed script load. Document capture fires before the
+    // element handlers the site uses to init its player.
+    const PLAYER_SCRIPT_RES = [/player\.twitch\.tv\/js\/embed/, /youtube\.com\/iframe_api/];
+    const wrapPlayers = () => { wrapTwitchPlayer(); wrapYTPlayer(); };
+    document.addEventListener('load', (e) => {
+        const src = (e.target && e.target.src) || '';
+        if (PLAYER_SCRIPT_RES.some((r) => r.test(src))) wrapPlayers();
+    }, true);
     try {
-        let _twitch = window.Twitch;
-        Object.defineProperty(window, 'Twitch', {
-            configurable: true, enumerable: true,
-            get() { return _twitch; },
-            set(v) {
-                _twitch = v;
-                if (window._lolWatcher.fakePlayerEnabled) { wrapTwitchPlayer(); }
-            }
-        });
+        for (const s of document.scripts) {
+            if (PLAYER_SCRIPT_RES.some((r) => r.test(s.src || ''))) { wrapPlayers(); break; }
+        }
     } catch (e) {}
-    try {
-        let _yt = window.YT;
-        Object.defineProperty(window, 'YT', {
-            configurable: true, enumerable: true,
-            get() { return _yt; },
-            set(v) {
-                _yt = v;
-                if (window._lolWatcher.fakePlayerEnabled) {
-                    try {
-                        if (_yt && !_yt.PlayerState) _yt.PlayerState = { UNSTARTED: -1, ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 };
-                    } catch (e2) {}
-                    wrapYTPlayer();
-                }
-            }
-        });
-    } catch (e) {}
-    setInterval(() => { if (window._lolWatcher.fakePlayerEnabled) { wrapTwitchPlayer(); wrapYTPlayer(); } }, 1000);
+
+    // SPA navigation hooks, content.js re-arms on these.
+    const _pushState = history.pushState, _replaceState = history.replaceState;
+    const notifyUrl = () => window.postMessage({ type: 'LOL_WATCHER_URL_CHANGED', url: location.href }, '*');
+    history.pushState = function() { const r = _pushState.apply(this, arguments); notifyUrl(); return r; };
+    history.replaceState = function() { const r = _replaceState.apply(this, arguments); notifyUrl(); return r; };
+    window.addEventListener('popstate', notifyUrl);
+    window.addEventListener('hashchange', notifyUrl);
 
     window.addEventListener('message', (e) => {
+        if (e.data?.type === 'LOL_WATCHER_REFIRE_REQUEST') { fireAllPlaying(); return; }
         if (e.data?.type === 'LOL_WATCHER_CONFIG') {
             window._lolWatcher.forceFixEnabled = e.data.config.forceFixEnabled;
             window._lolWatcher.debugMode = !!e.data.config.debugMode;
-            window._lolWatcher.preferredProvider = e.data.config.preferredProvider;
             window._lolWatcher.fakePlayerEnabled = !!e.data.config.removePlayerEnabled;
             if (e.data.config.gqlTable) window._lolWatcher.gqlTable = e.data.config.gqlTable;
             debug('[LoL Watcher] Config updated via message:', e.data.config);
@@ -388,69 +355,25 @@
         return originalFetch.apply(this, arguments);
     };
 
-    const filterStreamsToPreferred = (data) => {
-        const pref = window._lolWatcher?.preferredProvider;
-        if (!pref) return null;
-        // Earners with heartbeaters: twitch/youtube/afreecatv/trovo. Kick/soop never earn.
-        const EARNERS = ['twitch', 'youtube', 'afreecatv', 'trovo'];
-        const chain = [pref, ...EARNERS.filter(p => p !== pref), null];
-        let modified = false;
-
-        const applyFilter = (streams) => {
-            for (const p of chain) {
-                if (!p) return null;
-                const filtered = streams.filter(s => s.provider === p);
-                if (filtered.length) return { filtered, provider: p };
-            }
-            return null;
-        };
-
-        if (data?.data?.event?.streams?.length) {
-            const result = applyFilter(data.data.event.streams);
-            if (result) {
-                debug(`[LoL Watcher] filterStreams: event streams: ${data.data.event.streams.length} -> ${result.filtered.length} (keeping ${result.provider})`);
-                data.data.event.streams = result.filtered; modified = true;
-            }
-        }
-
-        if (data?.data?.schedule?.events) {
-            for (const event of data.data.schedule.events) {
-                if (event.streams?.length) {
-                    const result = applyFilter(event.streams);
-                    if (result) {
-                        debug(`[LoL Watcher] filterStreams: schedule event ${event.league?.name || '?'}: ${event.streams.length} -> ${result.filtered.length} (keeping ${result.provider})`);
-                        event.streams = result.filtered; modified = true;
-                    }
-                }
-            }
-        }
-
-        // Apollo gql stream paths: data.esports.events[].streams, data.scheduledEvent.streams.
-        if (data?.data?.esports?.events) {
-            for (const event of data.data.esports.events) {
-                if (event.streams?.length) {
-                    const result = applyFilter(event.streams);
-                    if (result) {
-                        debug(`[LoL Watcher] filterStreams: gql esports event: ${event.streams.length} -> ${result.filtered.length} (keeping ${result.provider})`);
-                        event.streams = result.filtered; modified = true;
-                    }
-                }
-            }
-        }
-
-        if (data?.data?.scheduledEvent?.streams?.length) {
-            const result = applyFilter(data.data.scheduledEvent.streams);
-            if (result) {
-                debug(`[LoL Watcher] filterStreams: gql scheduledEvent streams: ${data.data.scheduledEvent.streams.length} -> ${result.filtered.length} (keeping ${result.provider})`);
-                data.data.scheduledEvent.streams = result.filtered; modified = true;
-            }
-        }
-
-        return modified ? data : null;
-    };
-
     const patchedFetch = window.fetch;
     window.fetch = function(url, options) {
+        // GQL observer: harvest op/hash pairs, flag bad statuses. No body reads.
+        if (typeof url === 'string' || (url && typeof url.url === 'string')) {
+            const urlStr = typeof url === 'string' ? url : url.url;
+            if (urlStr.includes('/api/gql')) {
+                const gqlInfo = gqlRequestInfo(url, options);
+                if (gqlInfo && gqlInfo.hash) reportGqlPair(gqlInfo.op, gqlInfo.hash);
+                else if (gqlInfo && gqlInfo.op) debug(`[LoL Watcher] gql op without hash: ${gqlInfo.op}`);
+                if (gqlInfo) {
+                    return patchedFetch.apply(this, arguments).then(response => {
+                        if (!response.ok && (response.status === 400 || response.status === 404)) {
+                            window.postMessage({ type: 'LOL_WATCHER_GQL_ERROR', op: gqlInfo.op || null, status: response.status }, '*');
+                        }
+                        return response;
+                    });
+                }
+            }
+        }
         if (typeof url === 'string' && url.includes('rex.rewards.lolesports.com/v1/events/watch')) {
             return patchedFetch.apply(this, arguments).then(response => {
                 if (response.ok) {
@@ -461,55 +384,28 @@
                             debug(`[LoL Watcher] heartbeat flags: heartbeatability=${d.heartbeatability} droppability=${d.droppability} rewardability=${d.rewardability}`);
                         }).catch(() => {});
                     }
+                } else {
+                    debug(`[LoL Watcher] rex events/watch HTTP ${response.status}.`);
                 }
                 return response;
+            }).catch((err) => {
+                debug(`[LoL Watcher] rex events/watch failed: ${(err && err.message) || err}.`);
+                throw err;
             });
         }
         if (typeof url === 'string' && url.includes('rex.rewards.lolesports.com/v1/streams/startInfo')) {
             return patchedFetch.apply(this, arguments).then(response => {
                 if (response.ok) debug('[LoL Watcher] rex streams/startInfo OK.');
+                else debug(`[LoL Watcher] rex streams/startInfo HTTP ${response.status}.`);
                 if (response.ok && window._lolWatcher.debugMode) {
                     response.clone().json().then(d => {
                         debug(`[LoL Watcher] startInfo flags: heartbeatability=${d.heartbeatability} droppability=${d.droppability} rewardability=${d.rewardability}`);
                     }).catch(() => {});
                 }
                 return response;
-            });
-        }
-        // Filter legacy REST and /api/gql. Known stream ops are parsed, known others pass through, unknown ones are shape-sniffed.
-        if (window._lolWatcher.preferredProvider && (typeof url === 'string' || (url && typeof url.url === 'string')) && (
-            (typeof url === 'string' ? url : url.url).includes('/getEventDetails') || (typeof url === 'string' ? url : url.url).includes('/getSchedule') || (typeof url === 'string' ? url : url.url).includes('/api/gql')
-        )) {
-            const urlStr = typeof url === 'string' ? url : url.url;
-            const gqlInfo = urlStr.includes('/api/gql') ? gqlRequestInfo(url, options) : null;
-            if (gqlInfo && gqlInfo.hash) reportGqlPair(gqlInfo.op, gqlInfo.hash);
-            else if (gqlInfo && gqlInfo.op) debug(`[LoL Watcher] gql op without hash: ${gqlInfo.op}`);
-            const table = window._lolWatcher.gqlTable || {};
-            const knownOp = !!(gqlInfo && gqlInfo.op && table[gqlInfo.op]);
-            const streamOp = !!gqlInfo?.op && GQL_STREAM_OPS.includes(gqlInfo.op);
-            if (gqlInfo && knownOp && !streamOp) return patchedFetch.apply(this, arguments);
-            debug(`[LoL Watcher] Intercepting stream-list fetch to filter streams for "${window._lolWatcher.preferredProvider}"`);
-            const req = patchedFetch.apply(this, arguments);
-            return req.then(response => {
-                if (!response.ok) {
-                    if (gqlInfo && (response.status === 400 || response.status === 404)) {
-                        window.postMessage({ type: 'LOL_WATCHER_GQL_ERROR', op: gqlInfo.op || null, status: response.status }, '*');
-                    }
-                    return response;
-                }
-                const ct = response.headers.get('content-type') || '';
-                if (!ct.includes('json')) return response;
-                return response.clone().json().then(data => {
-                    if (gqlInfo && data && Array.isArray(data.errors) && data.errors.length) {
-                        const persisted = data.errors.some(e => /persisted/i.test(e.message || ''));
-                        window.postMessage({ type: 'LOL_WATCHER_GQL_ERROR', op: gqlInfo.op || null, status: persisted ? 'persisted-query' : 'graphql-errors' }, '*');
-                        return response;
-                    }
-                    const filtered = filterStreamsToPreferred(data);
-                    return filtered
-                        ? new Response(JSON.stringify(filtered), { status: response.status, statusText: response.statusText, headers: response.headers })
-                        : response;
-                }).catch(() => response);
+            }).catch((err) => {
+                debug(`[LoL Watcher] rex streams/startInfo failed: ${(err && err.message) || err}.`);
+                throw err;
             });
         }
         if (window._lolWatcher.forceFixEnabled && typeof url === 'string' && url.includes('/v1/session/clientconfig/rms')) {
