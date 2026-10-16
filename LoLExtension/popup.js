@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   tabs.forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','openDuringBroadcast','_statsData']);
+  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','gqlAlerts','openDuringBroadcast','_statsData']);
   const excludedLeagues = new Set(storage.excludedLeagues || []);
   let apiProviderId = storage.apiProvider || 'official';
   let statsData = storage._statsData || null;
@@ -501,6 +501,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const rpt = $('removePlayerToggle');
   const fft = $('forceFixToggle');
   const dt = $('debugToggle');
+  const gt = $('gqlAlertToggle');
   const bt = $('broadcastToggle');
   const pi = $('pollInterval');
   const piv = $('pollIntervalVal');
@@ -567,6 +568,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
+  gt.checked = storage.gqlAlerts || false;
+  gt.addEventListener('change', () => {
+    const en = gt.checked;
+    chrome.storage.local.set({ gqlAlerts: en });
+    showStatus(en ? 'API change alerts on' : 'API change alerts off');
+  });
+
   bt.checked = storage.openDuringBroadcast || false;
   bt.addEventListener('change', () => {
     const en = bt.checked;
@@ -599,6 +607,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (changes.removePlayerEnabled) rpt.checked = changes.removePlayerEnabled.newValue;
       if (changes.forceFixEnabled && fft) fft.checked = changes.forceFixEnabled.newValue;
       if (changes.debugMode) dt.checked = changes.debugMode.newValue;
+      if (changes.gqlAlerts) gt.checked = changes.gqlAlerts.newValue;
       if (changes.pollInterval) {
         pi.value = changes.pollInterval.newValue;
         piv.textContent = changes.pollInterval.newValue + 'm';

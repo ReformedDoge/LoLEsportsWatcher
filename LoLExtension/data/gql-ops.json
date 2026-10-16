@@ -1,0 +1,82 @@
+{
+  "version": "2026-10-16.3",
+  "client": { "name": "Esports Web", "version": "1f05c07" },
+  "streamOps": [
+    "homeEvents",
+    "scheduleEvents",
+    "watchLiveQuery",
+    "watchVodQuery"
+  ],
+  "ops": {
+    "getLeagues": {
+      "hash": "6b0dd6c3cfb78f6bf2712db29496cdd8364f8c96d8a62704c5169c0ff8bd3086",
+      "type": "query",
+      "streamsPaths": [],
+      "seen": false
+    },
+    "GetRewardsOpting": {
+      "hash": "90715aea51221ea4414a2da61ddc2b4b4d41704d2d5244530f5f2354cf97d668",
+      "type": "query",
+      "streamsPaths": [],
+      "seen": false
+    },
+    "GetWatchStats": {
+      "hash": "24022a037a40470c69528144edac6ff3e294bd28c9ed0f0fbee98999db09d337",
+      "type": "query",
+      "streamsPaths": [],
+      "seen": false
+    },
+    "UpdateRewardsOpting": {
+      "hash": "2c2c7e7c595a3441050d0aeb2c5463b88127c37a96c64255ee8a7d32be8b10ea",
+      "type": "mutation",
+      "streamsPaths": [],
+      "seen": false
+    },
+    "homeEvents": {
+      "hash": "a4ca0434b4c3af4f3f95b4d7b03fe2a3fcdda0a36887d4f181da99cf3786f664",
+      "type": "query",
+      "streamsPaths": [
+        "data.esports.events[].streams"
+      ],
+      "seen": false
+    },
+    "scheduleEvents": {
+      "hash": "f5a7bb64c62eca0f19b048a5835197e8f322b47170a1772ba47bffc0945310ce",
+      "type": "query",
+      "streamsPaths": [
+        "data.esports.events[].streams"
+      ],
+      "seen": false
+    },
+    "watchLiveLeaguesQuery": {
+      "hash": "40a17f2e4a262c9d5afc78c250b71806e2f68d32b8b0bb6f5ae939c46fa7335b",
+      "type": "query",
+      "streamsPaths": [],
+      "seen": false
+    },
+    "watchLiveQuery": {
+      "hash": "b67230b177d865a4ca5bd9c876fa884745f8fd2696e63c7214c9b5b718608ff0",
+      "type": "query",
+      "streamsPaths": [
+        "data.esports.events[].streams"
+      ],
+      "seen": false
+    },
+    "watchSingleLiveEventByLeagueQuery": {
+      "hash": "ad88c14eaed96ae0c82c852c5acdc632708a051fada6c0a27401d247164ea327",
+      "type": "query",
+      "streamsPaths": [
+        "data.esports.events[] (ids only)"
+      ],
+      "seen": false
+    },
+    "watchVodQuery": {
+      "hash": "7e607daa5563255b3233551b81ab664827542ce52daeb38a36e1177ce514e67c",
+      "type": "query",
+      "streamsPaths": [
+        "data.scheduledEvent.streams"
+      ],
+      "seen": false
+    }
+  }
+}

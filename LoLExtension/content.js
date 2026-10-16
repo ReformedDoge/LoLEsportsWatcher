@@ -8,18 +8,36 @@ chrome.runtime.onMessage.addListener((message) => {
     if (message.action === "togglePlayerRemoval") {
         if (message.enabled) {
             log('Player Removal ENABLED.');
+            chrome.storage.local.get(["forceFixEnabled", "debugMode", "provider"], (data) => {
+                window.postMessage({
+                    type: 'LOL_WATCHER_CONFIG',
+                    config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider || 'twitch', removePlayerEnabled: true }
+                }, '*');
+            });
             enablePlayerRemoval();
         } else {
-            log('Player Removal DISABLED.');
+            log('Player Removal DISABLED. (Reload the page to restore the real player.)');
+            chrome.storage.local.get(["forceFixEnabled", "debugMode", "provider"], (data) => {
+                window.postMessage({
+                    type: 'LOL_WATCHER_CONFIG',
+                    config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider || 'twitch', removePlayerEnabled: false }
+                }, '*');
+            });
             removeListeners();
         }
     }
 });
 
 const HOMEPAGE_PLAYER_SECTION = 'section[data-tag="media"]';
-const LIVE_PLAYER = "#video-player";
-const REWARDS_BUTTON = '.status-summary[role="button"]';
+// Removes #video-player-placeholder (or legacy #video-player). Layout box stays intact.
+const LIVE_PLAYER_SELECTORS = ['#video-player-placeholder', '#video-player'];
 const OBSERVER_TIMEOUT = 30000;
+// Grace period for the heartbeat-or-button fallback.
+const WATCH_OK_TIMEOUT = 90000;
+
+let fakeHeartbeatOk = false;
+// Master switch for all player removal paths.
+let removalEnabled = false;
 
 let currentObserver = null;
 let currentObserverTimeout = null;
@@ -56,13 +74,122 @@ function removeHomepagePlayer() {
 }
 
 function removeLivePlayer() {
-    const player = document.querySelector(LIVE_PLAYER);
-    if (player) { player.remove(); log('Removed live video player'); }
+    for (const sel of LIVE_PLAYER_SELECTORS) {
+        const player = document.querySelector(sel);
+        if (player) {
+            // The heartbeat holds the player object, not the DOM node.
+            player.remove();
+            log(`Removed live video player (${sel})`);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Rewards button: button[aria-expanded][aria-controls] with a [data-type] icon.
+function findRewardsButton() {
+    const btns = document.querySelectorAll('button[aria-expanded][aria-controls]');
+    for (const b of btns) {
+        if (b.getAttribute('aria-label')) continue;
+        if (b.querySelector('[data-type]')) return b;
+    }
+    return null;
+}
+
+function isLivePage() {
+    return location.href.includes('/live/');
+}
+
+// Preferred-provider lock: hides other provider radios, auto-selects once per page.
+let preferredProvider = null;
+let providerLockUrl = null;
+let providerLockAttempted = false;
+let providerStyleEl = null;
+let providerHideValue = null;
+// Provider fallback: preferred first, then twitch/youtube/afreecatv/trovo. No kick/soop, they never earn.
+const PROVIDER_FALLBACK_ORDER = ['twitch', 'youtube', 'afreecatv', 'trovo'];
+
+function providerChain() {
+    return [preferredProvider, ...PROVIDER_FALLBACK_ORDER.filter(p => p !== preferredProvider)];
+}
+
+function availableProviders() {
+    const seen = [];
+    for (const b of document.querySelectorAll('div[role="radiogroup"] button[role="radio"][value]')) {
+        const v = b.getAttribute('value');
+        if (v && !seen.includes(v)) seen.push(v);
+    }
+    return seen;
+}
+
+function effectiveProvider() {
+    const have = new Set(availableProviders());
+    for (const p of providerChain()) {
+        if (p && have.has(p)) return p;
+    }
+    return null;
+}
+
+function updateProviderHide() {
+    const eff = (preferredProvider && isLivePage()) ? effectiveProvider() : null;
+    if (eff === providerHideValue) return;
+    providerHideValue = eff;
+    if (providerStyleEl) { providerStyleEl.remove(); providerStyleEl = null; }
+    if (!eff) return;
+    providerStyleEl = document.createElement('style');
+    providerStyleEl.id = 'lol-watcher-provider-lock';
+    providerStyleEl.textContent =
+        `div[role="radiogroup"] button[role="radio"][value]:not([value="${eff}"]){display:none !important}`;
+    (document.head || document.documentElement).appendChild(providerStyleEl);
+}
+
+function selectedProviderValue() {
+    const btns = document.querySelectorAll('div[role="radiogroup"] button[role="radio"][value]');
+    for (const b of btns) {
+        if (b.getAttribute('data-selected') === 'true' || b.getAttribute('aria-checked') === 'true') {
+            return b.getAttribute('value');
+        }
+    }
+    return null;
+}
+
+function applyProviderLock() {
+    if (!preferredProvider || !isLivePage()) return;
+    if (location.href !== providerLockUrl) {
+        providerLockUrl = location.href;
+        providerLockAttempted = false;
+    }
+    updateProviderHide();
+    if (providerLockAttempted) return;
+    const eff = effectiveProvider();
+    if (!eff) return;
+    const selected = selectedProviderValue();
+    if (!selected || selected === eff) return;
+    const target = document.querySelector(
+        `div[role="radiogroup"] button[role="radio"][value="${eff}"]`);
+    if (!target) return;
+    providerLockAttempted = true;
+    log(`Provider lock: switching ${selected} -> ${eff}` +
+        (eff !== preferredProvider ? ` (fallback, ${preferredProvider} unavailable)` : ''));
+    target.click();
+}
+
+let providerLockObserver = null;
+function enableProviderLock() {
+    updateProviderHide();
+    if (!preferredProvider || !isLivePage()) return;
+    applyProviderLock();
+    if (providerLockObserver) return;
+    const root = document.querySelector('#__next') || document.body || document.documentElement;
+    providerLockObserver = new MutationObserver(() => applyProviderLock());
+    providerLockObserver.observe(root, { childList: true, subtree: true });
 }
 
 function enablePlayerRemoval() {
     disconnectObserver();
-    if (location.href.startsWith("https://lolesports.com/live/")) {
+    removalEnabled = true;
+    fakeHeartbeatOk = false;
+    if (isLivePage()) {
         watchLivePlayer();
     } else if (location.href.startsWith("https://lolesports.com")) {
         waitForElement(HOMEPAGE_PLAYER_SECTION, removeHomepagePlayer);
@@ -79,29 +206,69 @@ function enablePlayerRemoval() {
 }
 
 function watchLivePlayer() {
-    if (document.querySelector(REWARDS_BUTTON)) {
-        removeLivePlayer();
+    // Remove after heartbeat confirmation, or when the rewards button renders.
+    if (fakeHeartbeatOk || findRewardsButton()) {
+        if (removeLivePlayer()) disconnectObserver();
     }
     const root = document.querySelector('#__next') || document.body || document.documentElement;
+    disconnectObserver();
     currentObserver = new MutationObserver(() => {
-        if (document.querySelector(REWARDS_BUTTON)) {
-            removeLivePlayer();
+        if (!removalEnabled) return;
+        if (fakeHeartbeatOk || findRewardsButton()) {
+            if (removeLivePlayer()) disconnectObserver();
         }
     });
     currentObserver.observe(root, { childList: true, subtree: true });
+    currentObserverTimeout = setTimeout(() => {
+        disconnectObserver();
+        if (!removalEnabled) return;
+        if (!fakeHeartbeatOk) {
+            // Final fallback attempt.
+            if (removeLivePlayer()) log('Removed live video player (late fallback)');
+            else log('Player removal timed out: no heartbeat and no rewards button seen');
+        }
+    }, Math.max(OBSERVER_TIMEOUT, WATCH_OK_TIMEOUT));
 }
 
 function removeListeners() {
+    removalEnabled = false;
     disconnectObserver();
     if (urlCheckInterval) { clearInterval(urlCheckInterval); urlCheckInterval = null; }
 }
 
-chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode", "provider"], (data) => {
-    if (data.removePlayerEnabled) enablePlayerRemoval();
+function postConfig(data) {
     window.postMessage({
         type: 'LOL_WATCHER_CONFIG',
-        config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider }
+        config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider || 'twitch', removePlayerEnabled: !!data.removePlayerEnabled, gqlTable: data.gqlTable || null }
     }, '*');
+}
+
+let gqlTable = null;
+
+chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode", "provider", "gqlTable"], (data) => {
+    preferredProvider = data.provider || 'twitch';
+    gqlTable = data.gqlTable || null;
+    if (data.removePlayerEnabled) enablePlayerRemoval();
+    enableProviderLock();
+    postConfig(data);
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes.provider) {
+        preferredProvider = changes.provider.newValue || 'twitch';
+        providerLockAttempted = false;
+        enableProviderLock();
+        chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode", "provider", "gqlTable"], postConfig);
+    }
+    if (changes.gqlTable) {
+        const prev = gqlTable ? Object.keys(gqlTable.ops || {}).sort().join(',') : '';
+        gqlTable = changes.gqlTable.newValue || null;
+        const next = gqlTable ? Object.keys(gqlTable.ops || {}).sort().join(',') : '';
+        if (next !== prev) {
+            chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode", "provider", "gqlTable"], postConfig);
+        }
+    }
 });
 
 // Drop Tracking & Webpack/Fetch Interceptors
@@ -206,12 +373,33 @@ window.addEventListener('message', (event) => {
     }
 
     if (event.data?.type === 'LOL_WATCHER_REQUEST_CONFIG') {
-        chrome.storage.local.get(["forceFixEnabled", "debugMode", "provider"], (data) => {
+        chrome.storage.local.get(["removePlayerEnabled", "forceFixEnabled", "debugMode", "provider", "gqlTable"], (data) => {
+            if (!preferredProvider) preferredProvider = data.provider || 'twitch';
+            if (!gqlTable) gqlTable = data.gqlTable || null;
             window.postMessage({
                 type: 'LOL_WATCHER_CONFIG',
-                config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider }
+                config: { forceFixEnabled: data.forceFixEnabled ?? true, debugMode: !!data.debugMode, preferredProvider: data.provider || 'twitch', removePlayerEnabled: !!data.removePlayerEnabled, gqlTable: data.gqlTable || null }
             }, '*');
         });
+        return;
+    }
+
+    if (event.data?.type === 'LOL_WATCHER_GQL_SEEN' || event.data?.type === 'LOL_WATCHER_GQL_CHUNKS' || event.data?.type === 'LOL_WATCHER_GQL_ERROR') {
+        chrome.runtime.sendMessage({ action: 'gqlSeen', kind: event.data.type, payload: event.data.pairs || event.data.chunks || { op: event.data.op, status: event.data.status } });
+        return;
+    }
+
+    if (event.data?.type === 'LOL_WATCHER_FAKE_HEARTBEAT') {
+        if (!removalEnabled) return;
+        if (event.data.state === 'watch-ok') {
+            if (!fakeHeartbeatOk) {
+                fakeHeartbeatOk = true;
+                log('Heartbeat confirmed (rex events/watch OK) — removing player');
+                if (removeLivePlayer()) disconnectObserver();
+            }
+        } else if (event.data.state === 'fake-init') {
+            log(`Fake ${event.data.provider || ''} player attached (no video bandwidth)`);
+        }
         return;
     }
 

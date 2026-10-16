@@ -1,5 +1,6 @@
 importScripts('helpers.js');
 importScripts('providers/official.js');
+importScripts('providers/gql.js');
 importScripts('providers/thirdparty.js');
 importScripts('leagues/tiers.js');
 
@@ -14,6 +15,125 @@ let leagueIdNameMap = {};
 initStats();
 initDebugMode();
 initLeagueIdNameMap();
+initGqlTable();
+
+// Persisted-query table: operation name -> {hash, seen}.
+let gqlTable = null;
+let gqlScannedChunks = null;
+
+async function initGqlTable() {
+    try {
+        const stored = await chrome.storage.local.get(['gqlTable', 'gqlScannedChunks']);
+        gqlTable = stored.gqlTable || null;
+        gqlScannedChunks = new Set(stored.gqlScannedChunks || []);
+        if (!gqlTable) {
+            const res = await fetch(chrome.runtime.getURL('data/gql-ops.json'));
+            const bundle = await res.json();
+            gqlTable = { version: bundle.version, client: bundle.client || null, ops: {} };
+            for (const [name, op] of Object.entries(bundle.ops || {})) {
+                gqlTable.ops[name] = { hash: op.hash, seen: false, seenAt: null };
+            }
+            await chrome.storage.local.set({ gqlTable });
+            debugLog(`initGqlTable: seeded ${Object.keys(gqlTable.ops).length} ops from bundle v${bundle.version}`);
+        } else {
+            const res = await fetch(chrome.runtime.getURL('data/gql-ops.json'));
+            const bundle = await res.json();
+            if (bundle.version !== gqlTable.version) {
+                let added = 0;
+                for (const [name, op] of Object.entries(bundle.ops || {})) {
+                    if (!gqlTable.ops[name]) {
+                        gqlTable.ops[name] = { hash: op.hash, seen: false, seenAt: null };
+                        added++;
+                    }
+                }
+                gqlTable.version = bundle.version;
+                if (bundle.client) gqlTable.client = bundle.client;
+                await chrome.storage.local.set({ gqlTable });
+                debugLog(`initGqlTable: bundle v${bundle.version}, added ${added} missing ops`);
+            }
+        }
+    } catch (e) {
+        console.warn('initGqlTable failed:', e);
+    }
+}
+
+function extractIdsFromJs(js) {
+    const found = {};
+    let m;
+    const re1 = /\{[^{}]{0,200}?\bname\s*:\s*"([A-Za-z_]\w*)"[^{}]{0,200}?\bid\s*:\s*"([a-f0-9]{64})"[^{}]*?\}/g;
+    while ((m = re1.exec(js))) found[m[1]] = m[2];
+    const re2 = /\{[^{}]{0,200}?\bid\s*:\s*"([a-f0-9]{64})"[^{}]{0,200}?\bname\s*:\s*"([A-Za-z_]\w*)"[^{}]*?\}/g;
+    while ((m = re2.exec(js))) found[m[2]] = m[1];
+    const re3 = /"([A-Z][A-Za-z0-9_]{2,60})"\s*:\s*"([a-f0-9]{64})"/g;
+    while ((m = re3.exec(js))) { if (!(m[1] in found)) found[m[1]] = m[2]; }
+    return found;
+}
+
+async function gqlNotify(detail) {
+    await chrome.storage.local.set({ gqlDrift: { at: Date.now(), detail } });
+    console.warn(`[GQL drift] ${detail}`);
+    if (await getFromLocalStorage('gqlAlerts', false)) {
+        debugLog(`[GQL] API drift detected: ${detail}`);
+    }
+}
+
+async function mergeGqlPairs(pairs, source) {
+    if (!gqlTable) await initGqlTable();
+    if (!gqlTable) return;
+    let changed = false;
+    const manifestWins = source === 'manifest';
+    for (const [op, hash] of Object.entries(pairs || {})) {
+        if (!/^[a-f0-9]{64}$/.test(hash || '')) continue;
+        const cur = gqlTable.ops[op];
+        if (!cur) {
+            gqlTable.ops[op] = { hash, seen: true, seenAt: Date.now() };
+            changed = true;
+        } else if (cur.hash !== hash) {
+            if (!cur.seen) {
+                cur.hash = hash; cur.seen = true; cur.seenAt = Date.now();
+                changed = true;
+            } else if (manifestWins) {
+                cur.hash = hash; cur.seenAt = Date.now();
+                changed = true;
+                gqlNotify(`hash changed for ${op} (manifest): ${cur.hash.slice(0, 12)} -> ${hash.slice(0, 12)}`);
+            } else {
+                gqlNotify(`hash drift suspected for ${op}: stored ${cur.hash.slice(0, 12)} vs wire ${hash.slice(0, 12)} (awaiting manifest scan)`);
+            }
+        } else if (!cur.seen) {
+            cur.seen = true; cur.seenAt = Date.now();
+            changed = true;
+        }
+    }
+    if (changed) await chrome.storage.local.set({ gqlTable });
+}
+
+async function scanGqlChunks(urls) {
+    if (!gqlTable) await initGqlTable();
+    const fresh = (urls || []).filter(u => u && !gqlScannedChunks.has(u)).slice(0, 40);
+    if (!fresh.length) return;
+    for (const u of fresh) gqlScannedChunks.add(u);
+    if (gqlScannedChunks.size > 400) {
+        gqlScannedChunks = new Set([...gqlScannedChunks].slice(-200));
+    }
+    await chrome.storage.local.set({ gqlScannedChunks: [...gqlScannedChunks] });
+    let manifestPairs = {};
+    let manifestCount = 0;
+    for (const u of fresh) {
+        try {
+            const res = await fetch(u);
+            if (!res.ok) continue;
+            const text = await res.text();
+            if (text.length > 2500000) continue;
+            const found = extractIdsFromJs(text);
+            const n = Object.keys(found).length;
+            if (n >= 10) { manifestCount++; Object.assign(manifestPairs, found); }
+        } catch (e) {}
+    }
+    if (manifestCount) {
+        debugLog(`scanGqlChunks: manifest entries from ${manifestCount} chunk(s)`);
+        await mergeGqlPairs(manifestPairs, 'manifest');
+    }
+}
 
 async function getLeagueWindowMap() {
     return await getFromLocalStorage('leagueWindowMap', {});
@@ -370,7 +490,9 @@ async function reconfigureAlarm() {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    debugLog(`onMessage: ${message.action}`, message);
+    if (message.action !== 'gqlSeen' || message.kind !== 'LOL_WATCHER_GQL_CHUNKS') {
+        debugLog(`onMessage: ${message.action}`, message);
+    }
 
     if (message.action === "togglePlayerRemoval") {
         debugLog(`Player Removal ${message.enabled ? "ENABLED" : "DISABLED"}`);
@@ -417,6 +539,50 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             pollInterval: message.pollInterval || 3,
             debugMode: _debugMode
         });
+        })();
+        return true;
+    }
+
+    if (message.action === "compareProviders") {
+        (async () => {
+            const out = {};
+            for (const pid of ['official', 'gql', 'thirdparty']) {
+                const p = getProvider(pid);
+                if (!p) { out[pid] = { error: 'missing' }; continue; }
+                const t0 = Date.now();
+                try {
+                    if (p.clearCache) p.clearCache();
+                    const sched = await p.getSchedule();
+                    const events = sched?.data?.schedule?.events || [];
+                    const states = {};
+                    for (const e of events) states[e.state] = (states[e.state] || 0) + 1;
+                    const leagues = await p.getLeagues();
+                    const s0 = events.find(e => e.state === 'inProgress');
+                    out[pid] = {
+                        ms: Date.now() - t0,
+                        events: events.length,
+                        states,
+                        leagues: Object.keys(leagues).length,
+                        liveSample: s0 ? { league: s0.league?.name, match: !!s0.match?.id, streams: s0.streams?.length } : null
+                    };
+                } catch (e) { out[pid] = { error: String((e && e.message) || e) }; }
+            }
+            sendResponse(out);
+        })();
+        return true;
+    }
+
+    if (message.action === "testEventDetails") {
+        (async () => {
+            const provider = await getCurrentProvider();
+            provider.clearCache();
+            const status = await computeLeagueStatus();
+            const live = Object.entries(status).find(([_, s]) => s.state === 'live');
+            const leagueName = live ? live[0] : 'Worlds';
+            const result = await fetchStreams(leagueName);
+            sendResponse({ success: true, league: leagueName,
+                streams: result.streams.length, hasStreams: result.hasStreams,
+                providers: [...new Set(result.streams.map(s => s.provider))] });
         })();
         return true;
     }
@@ -513,6 +679,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sendResponse({ leagueName });
         })();
         return true;
+    }
+
+    if (message.action === "gqlSeen") {
+        (async () => {
+            if (message.kind === 'LOL_WATCHER_GQL_SEEN') {
+                await mergeGqlPairs(message.payload, 'wire');
+            } else if (message.kind === 'LOL_WATCHER_GQL_CHUNKS') {
+                await scanGqlChunks(message.payload);
+            } else if (message.kind === 'LOL_WATCHER_GQL_ERROR') {
+                const detail = `gql error op=${message.payload?.op || '?'} status=${message.payload?.status || '?'}`;
+                debugLog(`[GQL] ${detail}`);
+                await chrome.storage.local.set({ gqlDrift: { at: Date.now(), detail } });
+            }
+        })();
+        return false;
     }
 
     if (message.action === "log") {

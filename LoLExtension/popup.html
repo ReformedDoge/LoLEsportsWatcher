@@ -79,8 +79,8 @@
     <div class="card">
       <h3>Streaming</h3>
       <div class="row">
-        <div><div class="sl">Preferred platform</div><div class="sh">Twitch or YouTube first</div></div>
-        <select id="streamProvider"><option value="twitch">Twitch</option><option value="youtube">YouTube</option></select>
+        <div><div class="sl">Preferred platform</div><div class="sh">Heartbeatable providers earn drops; Kick/Soop can't</div></div>
+        <select id="streamProvider"><option value="twitch">Twitch</option><option value="youtube">YouTube</option><option value="afreecatv">Soop</option><option value="trovo">Trovo</option></select>
       </div>
       <div class="row">
         <div><div class="sl">Open during pre-show</div><div class="sh">Broadcast phase before matches start</div></div>
@@ -106,6 +106,10 @@
       <div class="row">
         <div><div class="sl">Debug logging</div><div class="sh">Detailed logs in service worker console</div></div>
         <label class="ts"><input type="checkbox" id="debugToggle"><span class="tsl"></span></label>
+      </div>
+      <div class="row">
+        <div><div class="sl">API change alerts</div><div class="sh">Log when lolesports.com changes its data API</div></div>
+        <label class="ts"><input type="checkbox" id="gqlAlertToggle"><span class="tsl"></span></label>
       </div>
     </div>
     <div class="s-st" id="settingsStatus"></div>

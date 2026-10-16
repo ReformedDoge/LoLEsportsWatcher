@@ -1,6 +1,6 @@
 const officialProvider = {
     id: PROVIDER_OFFICIAL,
-    name: 'Official LoL Esports API',
+    name: 'Official LoL API (Legacy)',
     _scheduleCache: null,
     _scheduleCacheTime: 0,
     _cacheTTL: 60000,

@@ -6,13 +6,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     const rpt = $('removePlayerToggle');
     const fft = $('forceFixToggle');
     const dt = $('debugToggle');
+    const gt = $('gqlAlertToggle');
     const pi = $('pollInterval');
     const piv = $('pollIntervalVal');
     const statusMsg = $('statusMsg');
 
     $('closeLink').addEventListener('click', () => window.close());
 
-    const storage = await chrome.storage.local.get(['apiProvider', 'windowState', 'provider', 'removePlayerEnabled', 'forceFixEnabled', 'pollInterval', 'debugMode']);
+    const storage = await chrome.storage.local.get(['apiProvider', 'windowState', 'provider', 'removePlayerEnabled', 'forceFixEnabled', 'pollInterval', 'debugMode', 'gqlAlerts']);
 
     for (const p of getAllProviders()) {
         const btn = document.createElement('button');
@@ -67,6 +68,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     });
 
+    gt.checked = storage.gqlAlerts || false;
+    gt.addEventListener('change', () => {
+        const en = gt.checked;
+        chrome.storage.local.set({ gqlAlerts: en });
+        showStatus(en ? 'API change alerts on' : 'API change alerts off', true);
+    });
+
     const pollVal = storage.pollInterval || 3;
     pi.value = pollVal;
     piv.textContent = pollVal + 'm';
@@ -91,6 +99,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (changes.removePlayerEnabled) rpt.checked = changes.removePlayerEnabled.newValue;
             if (changes.forceFixEnabled && fft) fft.checked = changes.forceFixEnabled.newValue;
             if (changes.debugMode) dt.checked = changes.debugMode.newValue;
+            if (changes.gqlAlerts) gt.checked = changes.gqlAlerts.newValue;
             if (changes.pollInterval) {
                 pi.value = changes.pollInterval.newValue;
                 piv.textContent = changes.pollInterval.newValue + 'm';
