@@ -1,3 +1,5 @@
+const GQL_STREAM_FALLBACK = false;
+
 const gqlProvider = {
     id: PROVIDER_GQL,
     name: 'Official LoL API (GraphQL)',
@@ -56,10 +58,11 @@ const gqlProvider = {
         }
         this._streamsCache = {};
         const cutoff = Date.now() - 3 * 864e5;
+        const day = (t) => new Date(t).toISOString().slice(0, 10);
         let allEvents = [];
         let pageToken = null;
         for (let page = 0; page < 10; page++) {
-            const vars = { hl: 'en-GB', sport: ['lol'], pageSize: 100 };
+            const vars = { hl: 'en-GB', sport: ['lol'], pageSize: 100, eventDateStart: day(Date.now() - 3 * 864e5), eventDateEnd: day(Date.now() + 60 * 864e5) };
             if (pageToken) vars.pageToken = pageToken;
             const data = await this._op('scheduleEvents', vars);
             const batch = data?.data?.esports;
@@ -98,13 +101,29 @@ const gqlProvider = {
         if (this._streamsCache[leagueName]) {
             return this._streamsCache[leagueName];
         }
+        // scheduleEvents may carry streams when live; legacy details rescues
+        // when it does not. Unverifiable until a live event either way.
         const schedule = await this.getSchedule();
         const events = schedule?.data?.schedule?.events || [];
         let streams = [];
+        const bare = [];
         for (const event of events) {
             if (event.state === 'completed') continue;
-            if (event.league?.name?.trim() === leagueName && event.streams?.length) {
-                streams = streams.concat(event.streams);
+            if (event.league?.name?.trim() !== leagueName) continue;
+            if (event.streams?.length) streams = streams.concat(event.streams);
+            else if (event.match?.id) bare.push(event.match.id);
+        }
+        for (const matchId of bare) {
+            if (!GQL_STREAM_FALLBACK) break;
+            try {
+                const details = await fetchJson(`${OFFICIAL_API_BASE}/getEventDetails?id=${matchId}&hl=en-US`, {
+                    headers: { 'x-api-key': OFFICIAL_API_KEY }
+                });
+                if (details?.data?.event?.streams) {
+                    streams = streams.concat(details.data.event.streams);
+                }
+            } catch (error) {
+                console.error(`Failed to fetch streams for ${matchId}:`, error);
             }
         }
         const result = { streams, hasStreams: streams.length > 0 };
