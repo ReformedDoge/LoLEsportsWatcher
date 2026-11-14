@@ -78,6 +78,14 @@
       <div><div class="label">API change alerts</div><div class="hint">Log when lolesports.com changes its data API</div></div>
       <label class="tog-switch"><input type="checkbox" id="gqlAlertToggle"><span class="tog-slider"></span></label>
     </div>
+    <div class="row">
+      <div><div class="label">Dev bridge (WebSocket)</div><div class="hint">Live diagnosis link for dev-bridge-server.py; keep off otherwise</div></div>
+      <label class="tog-switch"><input type="checkbox" id="devBridgeToggle"><span class="tog-slider"></span></label>
+    </div>
+    <div class="row" id="devBridgeUrlRow">
+      <div><div class="label">Bridge URL</div><div class="hint">Must match the server address</div></div>
+      <input type="text" id="devBridgeUrl" spellcheck="false">
+    </div>
   </div>
   <div class="status" id="statusMsg"></div>
 </div>

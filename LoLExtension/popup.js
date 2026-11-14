@@ -25,7 +25,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   tabs.forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','gqlAlerts','openDuringBroadcast','_statsData']);
+  const storage = await chrome.storage.local.get(['excludedLeagues','apiProvider','windowState','provider','removePlayerEnabled','forceFixEnabled','pollInterval','debugMode','gqlAlerts','openDuringBroadcast','devBridgeEnabled','_statsData']);
   const excludedLeagues = new Set(storage.excludedLeagues || []);
   let apiProviderId = storage.apiProvider || 'official';
   let statsData = storage._statsData || null;
@@ -502,6 +502,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const fft = $('forceFixToggle');
   const dt = $('debugToggle');
   const gt = $('gqlAlertToggle');
+  const dbt = $('devBridgeToggle');
   const bt = $('broadcastToggle');
   const pi = $('pollInterval');
   const piv = $('pollIntervalVal');
@@ -582,6 +583,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     showStatus(en ? 'Broadcast windows on' : 'Broadcast windows off');
   });
 
+  if (dbt) {
+    dbt.checked = storage.devBridgeEnabled || false;
+    dbt.addEventListener('change', () => {
+      const en = dbt.checked;
+      chrome.storage.local.set({ devBridgeEnabled: en });
+      showStatus(en ? 'Dev bridge on (needs dev-bridge-server.py running)' : 'Dev bridge off');
+    });
+  }
+
   const pollVal = storage.pollInterval || 3;
   pi.value = pollVal;
   piv.textContent = pollVal + 'm';
@@ -619,6 +629,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
       }
       if (changes.openDuringBroadcast && bt) bt.checked = changes.openDuringBroadcast.newValue;
+      if (changes.devBridgeEnabled && dbt) dbt.checked = changes.devBridgeEnabled.newValue;
     }
   });
 

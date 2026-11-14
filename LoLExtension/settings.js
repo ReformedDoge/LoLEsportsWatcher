@@ -7,13 +7,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     const fft = $('forceFixToggle');
     const dt = $('debugToggle');
     const gt = $('gqlAlertToggle');
+    const dbt = $('devBridgeToggle');
+    const dbu = $('devBridgeUrl');
     const pi = $('pollInterval');
     const piv = $('pollIntervalVal');
     const statusMsg = $('statusMsg');
 
     $('closeLink').addEventListener('click', () => window.close());
 
-    const storage = await chrome.storage.local.get(['apiProvider', 'windowState', 'provider', 'removePlayerEnabled', 'forceFixEnabled', 'pollInterval', 'debugMode', 'gqlAlerts']);
+    const storage = await chrome.storage.local.get(['apiProvider', 'windowState', 'provider', 'removePlayerEnabled', 'forceFixEnabled', 'pollInterval', 'debugMode', 'gqlAlerts', 'devBridgeEnabled', 'devBridgeUrl']);
 
     for (const p of getAllProviders()) {
         const btn = document.createElement('button');
@@ -75,6 +77,22 @@ document.addEventListener('DOMContentLoaded', async () => {
         showStatus(en ? 'API change alerts on' : 'API change alerts off', true);
     });
 
+    if (dbt) {
+        dbt.checked = storage.devBridgeEnabled || false;
+        dbu.value = storage.devBridgeUrl || 'ws://127.0.0.1:18790';
+        dbu.addEventListener('change', () => {
+            let v = dbu.value.trim() || 'ws://127.0.0.1:18790';
+            dbu.value = v;
+            chrome.storage.local.set({ devBridgeUrl: v });
+            showStatus('Bridge URL saved', true);
+        });
+        dbt.addEventListener('change', () => {
+            const en = dbt.checked;
+            chrome.storage.local.set({ devBridgeEnabled: en });
+            showStatus(en ? 'Dev bridge on (extension will connect out)' : 'Dev bridge off', true);
+        });
+    }
+
     const pollVal = storage.pollInterval || 3;
     pi.value = pollVal;
     piv.textContent = pollVal + 'm';
@@ -100,6 +118,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (changes.forceFixEnabled && fft) fft.checked = changes.forceFixEnabled.newValue;
             if (changes.debugMode) dt.checked = changes.debugMode.newValue;
             if (changes.gqlAlerts) gt.checked = changes.gqlAlerts.newValue;
+            if (changes.devBridgeEnabled && dbt) dbt.checked = changes.devBridgeEnabled.newValue;
+            if (changes.devBridgeUrl && dbu) dbu.value = changes.devBridgeUrl.newValue;
             if (changes.pollInterval) {
                 pi.value = changes.pollInterval.newValue;
                 piv.textContent = changes.pollInterval.newValue + 'm';

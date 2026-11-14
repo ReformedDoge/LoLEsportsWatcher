@@ -489,7 +489,8 @@ async function reconfigureAlarm() {
     });
 }
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+// dev bridge can dispatch into the exact same handlers the popup uses
+function handleExtensionAction(message, sender, sendResponse) {
     if (message.action !== 'gqlSeen' || message.kind !== 'LOL_WATCHER_GQL_CHUNKS') {
         debugLog(`onMessage: ${message.action}`, message);
     }
@@ -753,9 +754,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return false;
     }
 
+    if (message.action === "rmsEvent") {
+        const data = message.data || {};
+        debugLog(`[RMS] ${message.ev} ${JSON.stringify(data)}`);
+        bridgeEvent('rms', { ev: message.ev, ...data, page: sender?.tab ? (sender.tab.url || '').replace(/^https:\/\/lolesports\.com/, '') : null });
+    }
+
     if (message.action === "log") {
         debugLog(`[Content] ${message.message}`);
+        bridgeEvent('log', { msg: message.message, page: sender?.tab ? (sender.tab.url || '').replace(/^https:\/\/lolesports\.com/, '') : null });
     }
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    handleExtensionAction(message, sender, sendResponse);
 });
 
 chrome.windows.onRemoved.addListener(async (windowId) => {
@@ -888,6 +900,7 @@ async function resolveStreamUrl(matchURL, leagueName, matchID, provider) {
                 || pool[0];
             if (pick?.id) {
                 debugLog(`resolveStreamUrl(${leagueName}): ${p} stream ${pick.id} (${pick.mediaLocale?.locale || '?'})`);
+                bridgeEvent('stream', { league: leagueName, provider: p, streamId: pick.id, locale: pick.mediaLocale?.locale || null });
                 return replaceURL(matchURL, String(pick.id));
             }
         }
@@ -991,3 +1004,289 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
         await fetchSchedule();
     }
 });
+
+// Dev bridge: outbound WebSocket RPC for live diagnosis
+const DEV_COMMANDS = [
+    ['help', 'list bridge commands'],
+    ['ping', 'echo liveness'],
+    ['get-log', 'recent log ring {n}'],
+    ['get-storage', 'storage.local dump {dropsLimit}'],
+    ['get-gql', 'gql table + drift state'],
+    ['getStats', 'leagues/stats snapshot'],
+    ['forceRefresh', 'refetch schedule now'],
+    ['testGqlHashes', 'probe persisted-query manifest vs table'],
+    ['compareProviders', 'all providers parity snapshot'],
+    ['testEventDetails', 'legacy getEventDetails sample'],
+    ['setDebugMode', 'toggle debug logging {enabled}'],
+    ['list-tabs', 'all tabs with state'],
+    ['focus-tab', 'focus a tab {tabId}'],
+    ['reload-tab', 'reload a tab {tabId}'],
+    ['page-op', 'run a page inspection op {tabId, op, args}'],
+    ['fetch-text', 'fetch a lolesports.com file {url, name}'],
+];
+const DEV_PARITY_ACTIONS = new Set(['getStats', 'getPopupData', 'getProviders', 'forceRefresh', 'testGqlHashes', 'compareProviders', 'testEventDetails', 'setDebugMode', 'updatePollInterval', 'switchProvider']);
+
+const devBridge = { ws: null, connecting: false, backoffMs: 5000, lastError: null, pingTimer: null };
+
+function bridgeEvent(name, data) {
+    try {
+        if (devBridge.ws && devBridge.ws.readyState === 1) {
+            devBridge.ws.send(JSON.stringify({ event: name, ...data }));
+        }
+    } catch (e) {}
+}
+
+function devBridgeTick() {
+    if (devBridge.ws || devBridge.connecting) return;
+    chrome.storage.local.get(['devBridgeEnabled', 'devBridgeUrl'], (s) => {
+        if (!s.devBridgeEnabled) return;
+        devBridgeConnect(s.devBridgeUrl || 'ws://127.0.0.1:18790');
+    });
+}
+
+function devBridgeReconnect() {
+    try { devBridge.ws?.close(); } catch (e) {}
+    devBridge.ws = null;
+    devBridge.backoffMs = 5000;
+    devBridgeTick();
+}
+
+function devBridgeConnect(url) {
+    if (devBridge.ws || devBridge.connecting) return;
+    devBridge.connecting = true;
+    let ws;
+    try { ws = new WebSocket(url); } catch (e) { devBridge.connecting = false; scheduleDevBridgeRetry(); return; }
+    devBridge.ws = ws;
+    const openTimer = setTimeout(() => { try { ws.close(); } catch (e) {} }, 15000);
+    ws.onopen = () => {
+        clearTimeout(openTimer);
+        devBridge.connecting = false;
+        devBridge.backoffMs = 5000;
+        devBridge.lastError = null;
+        debugLog('dev bridge connected');
+        try {
+            ws.send(JSON.stringify({ role: 'ext', client: 'lolesports-watcher', commands: DEV_COMMANDS.map(([type, desc]) => ({ type, desc })) }));
+        } catch (e) {}
+        if (!devBridge.pingTimer) {
+            devBridge.pingTimer = setInterval(() => {
+                try { if (devBridge.ws && devBridge.ws.readyState === 1) devBridge.ws.send(JSON.stringify({ ping: Date.now() })); } catch (e) {}
+            }, 25000);
+        }
+    };
+    ws.onmessage = (m) => { handleDevBridgeFrame(m.data).catch(() => {}); };
+    const down = () => {
+        clearTimeout(openTimer);
+        devBridge.connecting = false;
+        if (devBridge.ws === ws) devBridge.ws = null;
+        try { ws.close(); } catch (e) {}
+        scheduleDevBridgeRetry();
+    };
+    ws.onclose = down;
+    ws.onerror = () => { devBridge.lastError = { ts: Date.now(), msg: 'socket error' }; };
+}
+
+function scheduleDevBridgeRetry() {
+    const wait = devBridge.backoffMs + Math.floor(Math.random() * 2000);
+    devBridge.backoffMs = Math.min(devBridge.backoffMs * 2, 60000);
+    setTimeout(() => devBridgeTick(), wait);
+}
+
+async function handleDevBridgeFrame(raw) {
+    let f;
+    try { f = JSON.parse(raw); } catch (e) { return; }
+    const ws = devBridge.ws;
+    const reply = (obj) => { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); } catch (e) {} };
+    if (f.hello) return;
+    if (f.id == null || !f.type) return;
+    const type = f.type;
+    if (type === 'ping') { reply({ id: f.id, ok: true, response: { pong: Date.now() } }); return; }
+    if (type === 'help') { reply({ id: f.id, ok: true, response: { commands: DEV_COMMANDS } }); return; }
+    const known = new Set(DEV_COMMANDS.map(([t]) => t));
+    if (!known.has(type)) { reply({ id: f.id, ok: false, error: 'unknown command (try help)' }); return; }
+
+    if (type === 'get-log') {
+        const n = Math.min((f.n | 0) || 200, 800);
+        const ring = globalThis.__lolLogRing || [];
+        reply({ id: f.id, ok: true, response: { count: ring.length, lines: ring.slice(-n) } });
+        return;
+    }
+    if (type === 'get-storage') {
+        const all = await chrome.storage.local.get(null);
+        const limit = (f.dropsLimit | 0) || 3;
+        if (Array.isArray(all.drops) && all.drops.length > limit) {
+            all.drops = { truncated: true, count: all.drops.length, sample: all.drops.slice(0, limit) };
+        }
+        reply({ id: f.id, ok: true, response: all });
+        return;
+    }
+    if (type === 'get-gql') {
+        const stored = await chrome.storage.local.get(['gqlTable', 'gqlDrift']);
+        reply({ id: f.id, ok: true, response: { table: stored.gqlTable || null, drift: stored.gqlDrift || null } });
+        return;
+    }
+    if (type === 'list-tabs') {
+        const tabs = await chrome.tabs.query({});
+        reply({ id: f.id, ok: true, response: tabs.map(t => ({ id: t.id, windowId: t.windowId, active: t.active, discarded: !!t.discarded, autoDiscardable: t.autoDiscardable, status: t.status, title: (t.title || '').slice(0, 80), url: ((t.pendingUrl || t.url) || '').slice(0, 160) })) });
+        return;
+    }
+    if (type === 'focus-tab') {
+        try {
+            const tab = await chrome.tabs.get(f.tabId);
+            await chrome.tabs.update(tab.id, { active: true });
+            await chrome.windows.update(tab.windowId, { focused: true });
+            reply({ id: f.id, ok: true, response: { focused: tab.id } });
+        } catch (e) { reply({ id: f.id, ok: false, error: String((e && e.message) || e) }); }
+        return;
+    }
+    if (type === 'reload-tab') {
+        chrome.tabs.reload(f.tabId, {}, () => {
+            const err = chrome.runtime.lastError;
+            reply({ id: f.id, ok: !err, response: { reloaded: f.tabId }, error: err ? err.message : undefined });
+        });
+        return;
+    }
+    if (type === 'page-op') {
+        reply({ id: f.id, ok: true, response: await runPageOp(f.tabId, f.op, f.args) });
+        return;
+    }
+    if (type === 'fetch-text') {
+        reply({ id: f.id, ok: true, response: await fetchBridgeText(f.url, f.name) });
+        return;
+    }
+    if (DEV_PARITY_ACTIONS.has(type)) {
+        let done = false;
+        const send = (resp) => {
+            if (done) return;
+            done = true;
+            reply({ id: f.id, ok: resp?.ok !== false, response: resp });
+        };
+        try { handleExtensionAction({ action: type, ...f }, { id: 'ws-bridge' }, send); } catch (e) { send({ ok: false, error: String((e && e.message) || e) }); }
+        setTimeout(() => send({ ok: false, error: 'action produced no response' }), 20000);
+        return;
+    }
+    reply({ id: f.id, ok: false, error: 'unknown command (try help)' });
+}
+
+// Page-op registry for bridge page-op. Static functions only: executeScript
+// serializes them, page CSP kills eval strings. Runs in MAIN world so
+// window._lolWatcher is visible.
+function popState() {
+    try {
+        const w = window._lolWatcher || null;
+        if (!w) return { ok: true, value: { present: false } };
+        const s = w._rmsState || null;
+        return { ok: true, value: {
+            present: true,
+            forceFixEnabled: w.forceFixEnabled,
+            debugMode: w.debugMode,
+            fakePlayerEnabled: w.fakePlayerEnabled,
+            rmsTrace: (w._rmsTrace || []).slice(-80),
+            rmsState: s ? {
+                hasSocket: !!s.socket,
+                socketState: s.socket ? s.socket.readyState : null,
+                hasUrl: !!s.url,
+                idleSec: s.lastActivity ? Math.round((Date.now() - s.lastActivity) / 1000) : null,
+                probeDelayMs: s.probeDelay,
+                intentional: !!s.intentional,
+                probePending: !!s.reconnectTimer
+            } : null
+        } };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function popNet(a) {
+    try {
+        const f = String((a && a.filter) || 'rms');
+        const lim = Math.min((a && a.limit | 0) || 40, 200);
+        const out = [];
+        for (const r of performance.getEntriesByType('resource')) {
+            if (f && !(r.name || '').toLowerCase().includes(f.toLowerCase())) continue;
+            out.push({ n: (r.name || '').split('?')[0].slice(0, 140), type: r.initiatorType, start: Math.round(r.startTime), dur: Math.round(r.duration), size: r.transferSize || 0 });
+            if (out.length >= lim) break;
+        }
+        return { ok: true, value: { page: location.href.split('?')[0], count: out.length, entries: out } };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function popDom(a) {
+    try {
+        const els = Array.from(document.querySelectorAll(String((a && a.sel) || ''))).slice(0, (a && a.limit | 0) || 20);
+        return { ok: true, value: els.map(el => ({ tag: el.tagName, id: el.id || null, cls: String(el.className || '').slice(0, 80), text: String(el.innerText || '').slice(0, 120) })) };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function popAttr(a) {
+    try {
+        const els = Array.from(document.querySelectorAll(String((a && a.sel) || ''))).slice(0, (a && a.limit | 0) || 20);
+        const attr = String((a && a.attr) || 'aria-label');
+        return { ok: true, value: els.map(el => ({ text: String(el.innerText || '').slice(0, 80), attr: (el.getAttribute && el.getAttribute(attr)) || '' })) };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function popScripts() {
+    try {
+        return { ok: true, value: Array.from(document.querySelectorAll('script[src]')).map(s => s.src.split('?')[0]).filter(s => s.includes('lolesports.com')).slice(0, 100) };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function popLs(a) {
+    try {
+        const f = String((a && a.filter) || '');
+        const store = (a && a.ses) ? sessionStorage : localStorage;
+        const out = [];
+        for (let i = 0; i < store.length; i++) {
+            const k = store.key(i);
+            if (f && !k.toLowerCase().includes(f.toLowerCase())) continue;
+            out.push({ k, v: String(store.getItem(k) || '').slice(0, 200) });
+            if (out.length >= 100) break;
+        }
+        return { ok: true, value: { keys: store.length, matches: out } };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+function popNow() {
+    try {
+        return { ok: true, value: {
+            href: location.href.split('?')[0],
+            lang: document.documentElement.lang || null,
+            hidden: document.hidden,
+            visibility: document.visibilityState,
+            wasDiscarded: !!document.wasDiscarded,
+            perfNow: Math.round(performance.now()),
+            cookies: document.cookie.split(';').map(c => c.split('=')[0].trim()).filter(Boolean)
+        } };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+const PAGE_OPS = { state: popState, net: popNet, dom: popDom, attr: popAttr, scripts: popScripts, ls: popLs, now: popNow };
+
+async function runPageOp(tabId, op, args) {
+    const fn = PAGE_OPS[op];
+    if (!fn) return { ok: false, error: 'unknown op (try: state, net, dom, attr, scripts, ls, now)' };
+    try {
+        const [res] = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: fn, args: [args || {}] });
+        return res?.result || { ok: false, error: 'no result' };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Bridge fetch-text: pull a lolesports.com JS/JSON files.
+// The server saves the body to dumps
+async function fetchBridgeText(url, name) {
+    let u;
+    try { u = new URL(url); } catch (e) { return { ok: false, error: 'bad url' }; }
+    const h = u.hostname;
+    if (u.protocol !== 'https:' || !(h === 'lolesports.com' || h.endsWith('.lolesports.com') || h === 'esports-api.lolesports.com')) {
+        return { ok: false, error: 'host not allowed (lolesports.com / esports-api.lolesports.com only)' };
+    }
+    try {
+        const r = await fetch(u.href, { credentials: 'omit' });
+        const text = await r.text();
+        return { ok: r.ok, status: r.status, url: u.href, name: name || (u.pathname.split('/').pop() || 'page.txt'), size: text.length, text };
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes.devBridgeEnabled || changes.devBridgeUrl) devBridgeReconnect();
+});
+devBridgeTick();

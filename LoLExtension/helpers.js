@@ -32,7 +32,18 @@ async function initDebugMode() {
     _debugMode = !!(await getFromLocalStorage('debugMode', false));
 }
 
+// Always-on ring buffer in the service worker, read by the dev bridge get-log.
+if (typeof importScripts === 'function' && !globalThis.__lolLogRing) {
+    globalThis.__lolLogRing = [];
+}
+
 function debugLog(...args) {
+    try {
+        if (globalThis.__lolLogRing) {
+            globalThis.__lolLogRing.push({ t: Date.now(), m: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ').slice(0, 500) });
+            if (globalThis.__lolLogRing.length > 800) globalThis.__lolLogRing.splice(0, globalThis.__lolLogRing.length - 800);
+        }
+    } catch (e) {}
     if (_debugMode) {
         console.log('[DEBUG]', ...args);
     }

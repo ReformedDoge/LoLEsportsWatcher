@@ -14,7 +14,8 @@
     "tabs",
     "storage",
     "activeTab",
-    "alarms"
+    "alarms",
+    "scripting"
   ],
   "host_permissions": [
     "https://leaguewatcher.onrender.com/*",

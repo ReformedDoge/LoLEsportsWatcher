@@ -267,12 +267,136 @@
         pageLog("Claimed master priority for RMS Fixes.");
     }
 
+    // RMS lifecycle trace: always-on ring in the page plus forwarded to the extension for the dev bridge.
+    const rmsTrace = (ev, data) => {
+        try {
+            const t = window._lolWatcher._rmsTrace || (window._lolWatcher._rmsTrace = []);
+            t.push({ t: Date.now(), ev, ...(data || {}) });
+            if (t.length > 80) t.splice(0, t.length - 80);
+        } catch (e) {}
+        try { window.postMessage({ type: 'LOL_WATCHER_RMS', ev, data: data || {} }, '*'); } catch (e) {}
+    };
+    const RMS_FALLBACK_CONFIG = {
+        "client_config_value": {
+            "rms.allow_bad_cert.enabled": false,
+            "rms.handshake_timeout_ms": 5000,
+            "rms.heartbeat_interval_seconds": 55,
+            "rms.host": "wss://eu.edge.rms.si.lolesports.com",
+            "rms.max_reconnect_delay_ms": 300000,
+            "rms.min_reconnect_delay_ms": 100,
+            "rms.port": 443,
+            "rms.protocol_preference": "ipv4",
+            "rms.socket_timeout_ms": 30000,
+            "rms.use_direct_connection": true
+        }
+    };
+
+    // RMS watchdog: tracks the live RMS socket so we can recover the drop feed after unclean closes, zombie sockets, or the site's runaway reconnect backoff.
+    // The site's client is sealed in a Turbopack closure, but the drop listeners attach to every RMS socket it sees, so any live socket keeps notifications flowing.
+    window._lolWatcher._rmsState = { socket: null, url: null, lastActivity: 0, reconnectTimer: null, probeDelay: 5000, sawLogout: false, intentional: false, selfReconnecting: false };
+    const rmsState = window._lolWatcher._rmsState;
+
+    const rmsUuid = () => {
+        try { return crypto.randomUUID(); } catch (e) {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0;
+                return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+            });
+        }
+    };
+
+    // The site reconnects with a fresh id and the old id as prev_id; mimic it.
+    const rmsReconnectUrl = (prevUrl) => {
+        try {
+            const m = /([?&])id=([^&]+)/.exec(prevUrl);
+            if (!m) return prevUrl;
+            let u = prevUrl.replace(/([?&])id=[^&]+/, `$1id=${rmsUuid()}`);
+            if (/[?&]prev_id=/.test(u)) u = u.replace(/([?&])prev_id=[^&]+/, `$1prev_id=${m[2]}`);
+            else u += `&prev_id=${m[2]}`;
+            return u;
+        } catch (e) { return prevUrl; }
+    };
+
+    const rmsSelfReconnect = () => {
+        if (!rmsState.url || rmsState.intentional) { rmsTrace('reconnect-miss', { intentional: rmsState.intentional }); return; }
+        const u = rmsReconnectUrl(rmsState.url);
+        rmsTrace('reconnect-self', { url: u.split('?')[0] });
+        rmsState.selfReconnecting = true;
+        try { new WebSocket(u); } catch (e) { rmsState.selfReconnecting = false; rmsTrace('reconnect-fail', {}); }
+    };
+
+    // Site sockets that the site itself killed via logout must not be revived.
+    const rmsScheduleProbe = () => {
+        if (!window._lolWatcher.forceFixEnabled) return;
+        if (rmsState.reconnectTimer) clearTimeout(rmsState.reconnectTimer);
+        rmsState.reconnectTimer = setTimeout(() => {
+            rmsState.reconnectTimer = null;
+            const s = rmsState.socket;
+            // Defer while the site's own attempt is in flight (CONNECTING) or a socket is already live; only revive a dead/absent socket.
+            if (s && s.readyState <= 1) { rmsTrace('reconnect-skip', { state: s.readyState }); return; }
+            rmsSelfReconnect();
+        }, rmsState.probeDelay || 5000);
+    };
+
+    // The site's own keep-alive payload ([137,5,72,101,108,108,111]). hello
+    const rmsPing = String.fromCharCode(137, 5, 72, 101, 108, 108, 111);
+
+    // Zombie check gated on the rex watch heartbeat: if the page is actively heartbeating but the RMS socket is silent for >150s,
+    // poke it with the site's own ping. A throw in the send wrapper closes it and the close chain recovers; a quiet-but-alive socket is left alone.
+    const rmsZombieCheck = () => {
+        if (!window._lolWatcher.forceFixEnabled) return;
+        const s = rmsState.socket;
+        if (!s) {
+            if (rmsState.url && !rmsState.intentional && !rmsState.reconnectTimer) rmsScheduleProbe();
+            return;
+        }
+        if (s.readyState !== 1) return;
+        const idle = Date.now() - rmsState.lastActivity;
+        if (idle < 150000) return;
+        rmsTrace('zombie-suspect', { idleSec: Math.round(idle / 1000) });
+        s.send(rmsPing);
+        if (s.readyState === 1) rmsTrace('zombie-ping-ok', {});
+    };
+
     const originalWebSocket = window.WebSocket;
     window.WebSocket = function(url, protocols) {
         const ws = protocols ? new originalWebSocket(url, protocols) : new originalWebSocket(url);
-        if (url.includes("rms.si.lolesports.com/rms/v1/session")) {
+        if (typeof url === 'string' && url.includes("rms.si.lolesports.com/rms/v1/session")) {
+            if (rmsState.reconnectTimer) { clearTimeout(rmsState.reconnectTimer); rmsState.reconnectTimer = null; }
+            if (rmsState.selfReconnecting) { ws._lwMine = true; rmsState.selfReconnecting = false; }
+            rmsState.intentional = false;
+            const prevSocket = rmsState.socket;
+            rmsState.socket = ws;
+            rmsState.url = url;
+            rmsState.lastActivity = Date.now();
+            rmsState.sawLogout = false;
+            // Retire our own leftover probe socket when a newer one arrives so at most one RMS session stays live.
+            if (prevSocket && prevSocket._lwMine && prevSocket.readyState <= 1) {
+                rmsTrace('probe-retired', {});
+                try { prevSocket.close(); } catch (e) {}
+            }
+            rmsTrace('ws-create', { url: url.split('?')[0] });
             debug("[LoL Watcher] Intercepted RMS WebSocket creation.");
+            // The site's keep-alive timer dies silently when send() throws inside it; wrapping send turns that into a close we can recover from. Non-open sends are no-ops so the chain never crashes.
+            const rmsSendOriginal = ws.send.bind(ws);
+            ws.send = function(data) {
+                if (typeof data === 'string' && data.indexOf('rms:logout') !== -1) rmsState.sawLogout = true;
+                if (ws.readyState !== 1) {
+                    rmsTrace('send-not-open', { state: ws.readyState });
+                    return;
+                }
+                try {
+                    return rmsSendOriginal(data);
+                } catch (e) {
+                    rmsTrace('send-fail', { err: String((e && e.message) || e).slice(0, 80) });
+                    try { ws.close(); } catch (e2) {}
+                    rmsScheduleProbe();
+                    return;
+                }
+            };
+            ws.addEventListener("open", () => { rmsState.probeDelay = 5000; rmsTrace('ws-open', {}); });
             ws.addEventListener("message", async (event) => {
+                rmsState.lastActivity = Date.now();
                 try {
                     let dataText = event.data;
                     if (event.data instanceof Blob) {
@@ -290,6 +414,7 @@
                         try {
                             const inner = JSON.parse(msg.payload.payload);
                             const dropId = inner.message?.i;
+                            rmsTrace('drop-fulfilled', { id: dropId || null });
                             if (dropId) {
                                 (function(id) {
                                     fetch("https://account.service.lolesports.com/fandom-account/v1/earnedDrops/" + id + "?locale=en_GB", {
@@ -305,19 +430,13 @@
                 } catch (e) {}
             });
             ws.addEventListener("close", (event) => {
-                if (window._lolWatcher.forceFixEnabled && !event.wasClean) {
-                    debug("[LoL Watcher] RMS WebSocket unclean close detected. Delaying managed reconnect...");
-                    setTimeout(() => {
-                        const rmsManager = window._lolWatcher.rmsSocketManager;
-                        if (rmsManager?.connect && rmsManager.rmsClientConfig) {
-                            debug("[LoL Watcher] Forcing reconnect via captured RMS manager.");
-                            rmsManager.connect(rmsManager.rmsClientConfig);
-                        } else {
-                            console.error("[LoL Watcher] No RMS manager captured to force reconnect.");
-                        }
-                    }, 5000);
-                }
+                rmsTrace('ws-close', { code: event.code, reason: String(event.reason || '').slice(0, 80), wasClean: !!event.wasClean, mine: !!ws._lwMine });
+                if (ws._lwMine) rmsState.probeDelay = Math.min(rmsState.probeDelay * 2, 60000);
+                // Logout means the site disconnected on purpose; don't revive.
+                if (rmsState.sawLogout) { rmsState.intentional = true; rmsTrace('close-intentional', {}); }
+                else rmsScheduleProbe();
             });
+            ws.addEventListener("error", () => rmsTrace('ws-error', {}));
         }
         return ws;
     };
@@ -325,35 +444,6 @@
     Object.assign(window.WebSocket, originalWebSocket);
 
     const originalFetch = window.fetch;
-    window.fetch = function(url, options) {
-        if (window._lolWatcher.forceFixEnabled && typeof url === 'string' && url.includes('/v1/session/clientconfig/rms')) {
-            return originalFetch.apply(this, arguments).then(response => {
-                if (!response.ok) throw new Error("RMS Config failed with status: " + response.status);
-                return response;
-            }).catch(error => {
-                debug("[LoL Watcher] Original RMS config fetch failed! Injecting fallback config.", error.message);
-                const fallbackConfig = {
-                    "client_config_value": {
-                        "rms.allow_bad_cert.enabled": false,
-                        "rms.handshake_timeout_ms": 5000,
-                        "rms.heartbeat_interval_seconds": 55,
-                        "rms.host": "wss://eu.edge.rms.si.lolesports.com",
-                        "rms.max_reconnect_delay_ms": 300000,
-                        "rms.min_reconnect_delay_ms": 100,
-                        "rms.port": 443,
-                        "rms.protocol_preference": "ipv4",
-                        "rms.socket_timeout_ms": 30000,
-                        "rms.use_direct_connection": true
-                    }
-                };
-                return new Response(JSON.stringify(fallbackConfig), {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' }
-                });
-            });
-        }
-        return originalFetch.apply(this, arguments);
-    };
 
     const patchedFetch = window.fetch;
     window.fetch = function(url, options) {
@@ -379,6 +469,7 @@
                 if (response.ok) {
                     notifyFake('watch-ok');
                     debug('[LoL Watcher] rex events/watch OK (heartbeat flowing).');
+                    rmsZombieCheck();
                     if (window._lolWatcher.debugMode) {
                         response.clone().json().then(d => {
                             debug(`[LoL Watcher] heartbeat flags: heartbeatability=${d.heartbeatability} droppability=${d.droppability} rewardability=${d.rewardability}`);
@@ -408,79 +499,36 @@
                 throw err;
             });
         }
-        if (window._lolWatcher.forceFixEnabled && typeof url === 'string' && url.includes('/v1/session/clientconfig/rms')) {
+        if (typeof url === 'string' && url.includes('/v1/session/clientconfig/rms')) {
             return patchedFetch.apply(this, arguments).then(response => {
-                if (!response.ok) throw new Error("RMS Config failed with status: " + response.status);
+                if (response.ok) {
+                    response.clone().json().then(d => rmsTrace('config-ok', { host: d?.client_config_value?.['rms.host'] || null })).catch(() => {});
+                } else {
+                    rmsTrace('config-fail', { status: response.status });
+                }
+                if (window._lolWatcher.forceFixEnabled && !response.ok) {
+                    debug("[LoL Watcher] RMS config fetch failed, injecting fallback config.", response.status);
+                    return new Response(JSON.stringify(RMS_FALLBACK_CONFIG), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
                 return response;
             }).catch(error => {
-                debug("[LoL Watcher] Original RMS config fetch failed! Injecting fallback config.", error.message);
-                const fallbackConfig = {
-                    "client_config_value": {
-                        "rms.allow_bad_cert.enabled": false,
-                        "rms.handshake_timeout_ms": 5000,
-                        "rms.heartbeat_interval_seconds": 55,
-                        "rms.host": "wss://eu.edge.rms.si.lolesports.com",
-                        "rms.max_reconnect_delay_ms": 300000,
-                        "rms.min_reconnect_delay_ms": 100,
-                        "rms.port": 443,
-                        "rms.protocol_preference": "ipv4",
-                        "rms.socket_timeout_ms": 30000,
-                        "rms.use_direct_connection": true
-                    }
-                };
-                return new Response(JSON.stringify(fallbackConfig), {
-                    status: 200,
-                    headers: { 'Content-Type': 'application/json' }
-                });
+                rmsTrace('config-fail', { err: String((error && error.message) || error).slice(0, 120) });
+                if (window._lolWatcher.forceFixEnabled) {
+                    debug("[LoL Watcher] RMS config fetch threw, injecting fallback config.", error.message);
+                    return new Response(JSON.stringify(RMS_FALLBACK_CONFIG), { status: 200, headers: { 'Content-Type': 'application/json' } });
+                }
+                throw error;
             });
         }
         return patchedFetch.apply(this, arguments);
     };
-
-    const patchAllModules = (modules) => {
-        for (const moduleId in modules) {
-            if (Object.prototype.hasOwnProperty.call(modules, moduleId)) {
-                const moduleString = modules[moduleId].toString();
-                if (moduleString.includes('Connecting WebSocket at ')) {
-                    const originalRmsModule = modules[moduleId];
-                    modules[moduleId] = function(module, exports, require) {
-                        originalRmsModule.apply(this, arguments);
-                        window._lolWatcher.rmsSocketManager = module.exports.default;
-                        debug('[LoL Watcher] RmsWebSocket manager instance captured for auto-reconnect.');
-                    };
-                }
-            }
-        }
-    };
-
-    const originalPush = window.webpackJsonp ? window.webpackJsonp.push : [].push;
-    const patchedPush = function() { 
-        const args = arguments; 
-        if (window._lolWatcher.forceFixEnabled && args[0] && args[0][1]) { 
-            patchAllModules(args[0][1]); 
-        } 
-        return originalPush.apply(window.webpackJsonp, args); 
-    };
-    
-    if (window.webpackJsonp) { 
-        window.webpackJsonp.push = patchedPush; 
-    } else { 
-        Object.defineProperty(window, 'webpackJsonp', { 
-            configurable: true, 
-            set(value) { 
-                Object.defineProperty(window, 'webpackJsonp', { value: value, writable: true }); 
-                value.push = patchedPush; 
-            }, 
-            get() { return undefined; } 
-        }); 
-    }
 
     window.postMessage({
         type: 'LOL_WATCHER_STATUS',
         status: {
             webSocketPatched: typeof window.WebSocket !== 'undefined' && window.WebSocket !== originalWebSocket,
             fetchPatched: typeof window.fetch !== 'undefined' && window.fetch !== originalFetch,
-            webpackPatched: !!(window.webpackJsonp?.push === patchedPush || Object.getOwnPropertyDescriptor(window, 'webpackJsonp')?.set),
+            rmsWatchdog: true,
             userscriptKilled: typeof window.__disableUserscriptMaster === 'function',
             fakePlayerEnabled: !!window._lolWatcher.fakePlayerEnabled,
             twitchPlayerWrapped: !!(window.Twitch && window.Twitch.Player && window.Twitch.Player.__lolWatcherFakeWrapped),

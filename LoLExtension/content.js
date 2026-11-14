@@ -359,6 +359,12 @@ window.addEventListener('message', (event) => {
         return;
     }
 
+    if (event.data?.type === 'LOL_WATCHER_RMS') {
+        log(`[RMS] ${event.data.ev} ${JSON.stringify(event.data.data || {})}`);
+        chrome.runtime.sendMessage({ action: 'rmsEvent', ev: event.data.ev, data: event.data.data || {} });
+        return;
+    }
+
     if (event.data?.type === 'LOL_WATCHER_URL_CHANGED') {
         handleUrlChange(event.data.url || location.href);
         return;
